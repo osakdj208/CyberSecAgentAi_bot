@@ -1,6 +1,7 @@
 services:
   - type: web
     name: cyber-agent
+    plan: free
     runtime: docker
     dockerfilePath: ./Dockerfile
     healthCheckPath: /docs
