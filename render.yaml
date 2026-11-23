@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: cyber-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /docs
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ENGINE_API_TOKEN
+        sync: false
+      - key: SCAN_APPROVAL_SECRET
+        sync: false
+      - key: ADMIN_TELEGRAM_ID
+        value: "964567764"
+      - key: BOT_DB_PATH
+        value: /tmp/bot.db
