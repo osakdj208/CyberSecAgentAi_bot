@@ -16,3 +16,7 @@ services:
         value: "964567764"
       - key: BOT_DB_PATH
         value: /tmp/bot.db
+      - key: BOT_MODE
+        value: webhook
+      - key: WEBHOOK_BASE
+        value: https://cyber-agent-raju.onrender.com
