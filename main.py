@@ -1,6 +1,6 @@
-import base64, hashlib, hmac, ipaddress, json, os, secrets, shutil, socket, subprocess, time, urllib.request, urllib.error, xml.etree.ElementTree as ET
+import base64, hashlib, hmac, ipaddress, json, os, secrets, shutil, socket, sqlite3, subprocess, time, urllib.request, urllib.error, xml.etree.ElementTree as ET
 from typing import Optional
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Cyber Security AI Agent Engine", version="0.4.0")
@@ -123,6 +123,40 @@ def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(defau
     passive=passive_intel(target)
     active=nmap_data(target,request.top_ports)
     return {"status":"completed","target":target,"authorization_reference":request.authorization_reference,"profile":"approved-public-ip-intelligence","passive":passive,"ports":active["ports"],"summary":active["summary"],"limitations":["Only the 100 most common TCP ports are checked by default.","No exploit attempts, credential attacks, vulnerability exploitation, or intrusive NSE scripts are run.","Reputation data requires an optional AbuseIPDB API key."]}
+
+
+# ------------------------------------------------------------ telegram webhook
+# Telegram pushes updates to this endpoint; they are queued in the bot's
+# SQLite DB (same file the bot process uses) and consumed by bot.py.
+# The path secret is derived from SCAN_APPROVAL_SECRET exactly as bot.py
+# derives it (webhook_secret), so no extra env var is needed.
+BOT_DB_PATH = os.environ.get("BOT_DB_PATH", "/tmp/bot.db")
+
+def _webhook_secret() -> str:
+    return hmac.new(PERMIT_SECRET.encode(), b"telegram-webhook-v1", hashlib.sha256).hexdigest()
+
+@app.post("/telegram/hook/{secret}")
+async def telegram_hook(secret: str, request: Request):
+    if not PERMIT_SECRET or not hmac.compare_digest(secret, _webhook_secret()):
+        raise HTTPException(status_code=404, detail="not found")
+    header_secret = request.headers.get("x-telegram-bot-api-secret-token")
+    if header_secret is not None and not hmac.compare_digest(header_secret, _webhook_secret()):
+        raise HTTPException(status_code=403, detail="bad secret token")
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad json")
+    update_id = update.get("update_id") if isinstance(update, dict) else None
+    if not isinstance(update_id, int):
+        raise HTTPException(status_code=400, detail="missing update_id")
+    conn = sqlite3.connect(BOT_DB_PATH, timeout=10)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS tg_updates(update_id INTEGER PRIMARY KEY, payload TEXT, processed INTEGER DEFAULT 0, received_at REAL)")
+        conn.execute("INSERT OR IGNORE INTO tg_updates VALUES (?,?,0,?)", (update_id, json.dumps(update), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
 
 
 # Backward-compatible guarded endpoint retained for existing engine clients/tests.
