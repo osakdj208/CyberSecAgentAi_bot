@@ -27,6 +27,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,6 +42,8 @@ PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
 DB_PATH = os.environ.get("BOT_DB_PATH", os.path.join(os.path.dirname(__file__), "bot.db"))
 APPROVAL_TTL_HOURS = 24          # same as the web workflow
 PERMIT_TTL_MS = 5 * 60 * 1000    # permit is minted at scan time, short-lived
+BOT_MODE = os.environ.get("BOT_MODE", "poll").strip().lower()
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
 
 CATALOG_NOTE = (
     "الكتالوج في المشروع يضم عشرات الأدوات (ZAP, Nuclei, Trivy, YARA وغيرها) "
@@ -60,7 +63,45 @@ def db():
                result TEXT, error TEXT,
                proof_file_id TEXT, proof_text TEXT)"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS tg_updates(
+               update_id INTEGER PRIMARY KEY, payload TEXT,
+               processed INTEGER DEFAULT 0, received_at REAL)"""
+    )
     return conn
+
+
+def enqueue_update(update):
+    """Store a Telegram update delivered by the engine's webhook endpoint."""
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO tg_updates VALUES (?,?,0,?)",
+            (update["update_id"], json.dumps(update), time.time()),
+        )
+
+
+def fetch_unprocessed(limit=20):
+    with db() as c:
+        rows = c.execute(
+            "SELECT update_id, payload FROM tg_updates WHERE processed=0"
+            " ORDER BY update_id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [(r["update_id"], r["payload"]) for r in rows]
+
+
+def mark_processed(update_id):
+    with db() as c:
+        c.execute("UPDATE tg_updates SET processed=1 WHERE update_id=?", (update_id,))
+
+
+def webhook_secret() -> str:
+    """Shared with the engine (main.py derives it identically). Derived from
+    SCAN_APPROVAL_SECRET so no extra env var is needed; never logged."""
+    if not PERMIT_SECRET:
+        raise RuntimeError("SCAN_APPROVAL_SECRET is not configured")
+    return hmac.new(PERMIT_SECRET.encode(), b"telegram-webhook-v1",
+                    hashlib.sha256).hexdigest()
 
 
 def save_request(req):
@@ -420,6 +461,58 @@ def handle_callback(cb):
             send(ADMIN_ID, f"❌ فشل فحص {req['ip']} ({rid[:8]}): {exc}")
 
 
+def process_update(update):
+    if "message" in update:
+        handle_message(update["message"])
+    elif "callback_query" in update:
+        handle_callback(update["callback_query"])
+
+
+def register_webhook_loop():
+    """Register the webhook with Telegram, retrying patiently (respecting
+    retry_after) until it lands. Runs in a background thread so queued
+    updates are consumed even while registration is still pending."""
+    secret = webhook_secret()
+    url = f"{WEBHOOK_BASE}/telegram/hook/{secret}"
+    wait = 30
+    while True:
+        try:
+            res = tg("setWebhook", url=url, secret_token=secret,
+                     allowed_updates=["message", "callback_query"],
+                     drop_pending_updates=False, max_connections=10,
+                     _http_timeout=30)
+            if res.get("ok"):
+                print("Webhook registered OK")
+                return
+            print("setWebhook not ok:", str(res)[:200])
+        except Exception as exc:
+            match = re.search(r'"retry_after":\s*(\d+)', str(exc))
+            if match:
+                wait = max(wait, int(match.group(1)) + 5)
+            print(f"setWebhook failed: {exc} (retry in {wait}s)")
+        time.sleep(wait)
+        wait = min(wait * 2, 600)
+
+
+def run_webhook_consumer():
+    print("Bot is running (webhook queue consumer)…")
+    while True:
+        try:
+            rows = fetch_unprocessed(20)
+            if not rows:
+                time.sleep(1)
+                continue
+            for update_id, payload in rows:
+                try:
+                    process_update(json.loads(payload))
+                except Exception as exc:  # one bad update must not stall the queue
+                    print("update error:", exc)
+                mark_processed(update_id)
+        except Exception as exc:
+            print("queue error:", exc)
+            time.sleep(3)
+
+
 def main():
     if not TOKEN and not HELPER:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN or TELEGRAM_API_HELPER (see .env.example)")
@@ -430,6 +523,10 @@ def main():
         print("Bot identity:", (me.get("result") or {}).get("username"))
     except Exception as exc:
         print("getMe failed:", exc)
+    if BOT_MODE == "webhook" and WEBHOOK_BASE and not HELPER:
+        threading.Thread(target=register_webhook_loop, daemon=True).start()
+        run_webhook_consumer()
+        return
     try:
         tg("deleteWebhook", drop_pending_updates=False)
     except Exception as exc:
@@ -462,10 +559,7 @@ def main():
         for update in resp.get("result", []):
             offset = update["update_id"] + 1
             try:
-                if "message" in update:
-                    handle_message(update["message"])
-                elif "callback_query" in update:
-                    handle_callback(update["callback_query"])
+                process_update(update)
             except Exception as exc:  # keep polling on per-update errors
                 print("update error:", exc)
 
