@@ -23,6 +23,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -192,6 +193,7 @@ HELPER = os.environ.get("TELEGRAM_API_HELPER", "")
 
 
 def tg(method, **params):
+    http_timeout = params.pop("_http_timeout", 130)
     if HELPER:
         out = subprocess.run(
             [sys.executable, HELPER, method, json.dumps(params)],
@@ -203,8 +205,12 @@ def tg(method, **params):
         f"https://api.telegram.org/bot{TOKEN}/{method}",
         data=json.dumps(params).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=130) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"telegram HTTP {exc.code}: {body}") from exc
 
 
 def send(chat_id, text, reply_markup=None):
@@ -419,16 +425,40 @@ def main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN or TELEGRAM_API_HELPER (see .env.example)")
     if not ADMIN_ID:
         print("WARNING: ADMIN_TELEGRAM_ID is not set - nobody can approve scans.")
+    try:
+        me = tg("getMe")
+        print("Bot identity:", (me.get("result") or {}).get("username"))
+    except Exception as exc:
+        print("getMe failed:", exc)
+    try:
+        tg("deleteWebhook", drop_pending_updates=False)
+    except Exception as exc:
+        print("deleteWebhook failed:", exc)
     offset = 0
+    backoff = 5
     print("Bot is running (long polling)…")
     while True:
         try:
-            resp = tg("getUpdates", offset=offset, timeout=120,
-                      allowed_updates=["message", "callback_query"])
+            resp = tg("getUpdates", offset=offset, timeout=50,
+                      allowed_updates=["message", "callback_query"],
+                      _http_timeout=70)
         except Exception as exc:
-            print("poll error:", exc)
-            time.sleep(5)
+            wait = backoff
+            text = str(exc)
+            match = re.search(r'"retry_after":\s*(\d+)', text)
+            if match:
+                wait = max(wait, int(match.group(1)) + 2)
+            if "409" in text:
+                wait = max(wait, 30)
+                try:
+                    tg("deleteWebhook", drop_pending_updates=False)
+                except Exception:
+                    pass
+            print(f"poll error: {exc} (retry in {wait}s)")
+            time.sleep(wait)
+            backoff = min(backoff * 2, 60)
             continue
+        backoff = 5
         for update in resp.get("result", []):
             offset = update["update_id"] + 1
             try:
