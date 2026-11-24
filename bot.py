@@ -483,7 +483,7 @@ def register_webhook_loop():
                      _http_timeout=30)
             if res.get("ok"):
                 print("Webhook registered OK")
-                return
+                break
             print("setWebhook not ok:", str(res)[:200])
         except Exception as exc:
             match = re.search(r'"retry_after":\s*(\d+)', str(exc))
@@ -492,6 +492,21 @@ def register_webhook_loop():
             print(f"setWebhook failed: {exc} (retry in {wait}s)")
         time.sleep(wait)
         wait = min(wait * 2, 600)
+    # Watchdog: if the webhook is ever removed or replaced, restore it.
+    while True:
+        time.sleep(300)
+        try:
+            info = tg("getWebhookInfo", _http_timeout=30)
+            current = (info.get("result") or {}).get("url", "")
+            if current != url:
+                print("Webhook missing/changed - re-registering")
+                tg("setWebhook", url=url, secret_token=secret,
+                   allowed_updates=["message", "callback_query"],
+                   drop_pending_updates=False, max_connections=10,
+                   _http_timeout=30)
+                print("Webhook re-registered OK")
+        except Exception as exc:
+            print("webhook watchdog error:", exc)
 
 
 def run_webhook_consumer():
