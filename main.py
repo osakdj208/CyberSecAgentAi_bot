@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.5.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.6.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -178,7 +178,7 @@ def nmap_scan(request: ScanRequest, authorization: Optional[str] = Header(defaul
 # resolved IP set it saw at approval time; the engine re-resolves and
 # requires its own resolved set to be a subset of the permitted set
 # (anti DNS-rebinding), and every resolved address must be globally routable.
-import re, ssl
+import re, ssl, urllib.parse
 try:
     import dns.resolver
 except Exception:  # dnspython optional: DNS section degrades honestly
@@ -195,6 +195,11 @@ class WebScanRequest(BaseModel):
     target_host: str
     authorization_reference: str = Field(min_length=4, max_length=120)
     confirm_authorized: bool
+    deep: bool = False
+    # Optional session cookie of a dedicated TEST account supplied by the
+    # site owner for authenticated detection. Used in-memory for this scan
+    # only: never stored, never logged, never echoed in the response.
+    auth_cookie: Optional[str] = Field(default=None, max_length=2048)
 
 def normalize_host(value: str) -> str:
     host = (value or "").strip().lower()
@@ -374,47 +379,246 @@ def parse_nuclei_jsonl(text: str):
     findings.sort(key=lambda f: order.get(f["severity"], 5))
     return findings[:100], counts
 
-def nuclei_scan(host: str):
+def _nuclei_base_args(cookie=None):
+    args = ["-jsonl", "-silent", "-nc", "-ni", "-duc",
+            "-severity", "low,medium,high,critical",
+            "-etags", "dos,intrusive,fuzz,brute-force",
+            "-rl", "25", "-c", "5", "-timeout", "6", "-retries", "1",
+            "-max-host-error", "3"]
+    if cookie:
+        args += ["-H", "Cookie: " + cookie]
+    return args
+
+def _run_nuclei(targets, template_dirs, cookie, cap):
     if not NUCLEI_PATH:
-        return {"status": "unavailable", "note": "Nuclei binary is not installed in this engine image."}
-    command = [NUCLEI_PATH, "-u", f"https://{host}", "-u", f"http://{host}",
-               "-jsonl", "-silent", "-nc", "-ni", "-duc",
-               "-severity", "low,medium,high,critical",
-               "-etags", "dos,intrusive,fuzz,brute-force",
-               "-rl", "25", "-c", "5", "-timeout", "6", "-retries", "1",
-               "-max-host-error", "3"]
-    if os.path.isdir(NUCLEI_TEMPLATES):
-        # Load only curated web-assessment template sets (~3.2k templates):
-        # the full tree costs minutes of startup and more RAM than a small
-        # free-tier instance has (it OOM-restarted the box in live testing).
-        rel_dirs = ("http/exposures", "http/misconfiguration",
-                    "http/vulnerabilities", "http/takeovers",
-                    "http/miscellaneous", "ssl", "dns", "network")
-        chosen = [os.path.join(NUCLEI_TEMPLATES, d) for d in rel_dirs]
-        chosen = [d for d in chosen if os.path.isdir(d)]
-        if chosen:
-            for d in chosen:
-                command += ["-t", d]
-        else:
-            command += ["-t", NUCLEI_TEMPLATES]
+        return None
+    command = [NUCLEI_PATH]
+    for t in targets:
+        command += ["-u", t]
+    command += _nuclei_base_args(cookie)
+    for d in template_dirs:
+        command += ["-t", d]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=480, check=False, shell=False)
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=cap, check=False, shell=False)
     except subprocess.TimeoutExpired:
-        return {"status": "timeout", "note": "Nuclei exceeded the 480s engine cap; partial results discarded."}
+        return {"status": "timeout", "findings": [], "counts": {}, "total": 0}
     findings, counts = parse_nuclei_jsonl(result.stdout)
     return {"status": "ready", "findings": findings, "counts": counts,
             "total": sum(counts.values())}
+
+CURATED_DIRS = ("http/exposures", "http/misconfiguration",
+                "http/vulnerabilities", "http/takeovers",
+                "http/miscellaneous", "ssl", "dns", "network")
+
+def _template_dirs(relative):
+    return [os.path.join(NUCLEI_TEMPLATES, r) for r in relative
+            if os.path.isdir(os.path.join(NUCLEI_TEMPLATES, r))]
+
+def nuclei_scan(host: str, deep: bool = False, cookie: str = None,
+                extra_targets=None):
+    """Curated detection scan; in deep mode the full CVE tree also runs,
+    one year per bounded batch, so peak memory stays free-tier safe."""
+    if not NUCLEI_PATH:
+        return {"status": "unavailable",
+                "note": "Nuclei binary is not installed in this engine image."}
+    base_targets = [f"https://{host}", f"http://{host}"]
+    targets = base_targets + [t for t in (extra_targets or [])
+                              if t not in base_targets][:30]
+    curated = _template_dirs(CURATED_DIRS)
+    merged = _run_nuclei(targets, curated or [NUCLEI_TEMPLATES], cookie, 480)
+    if merged is None:
+        return {"status": "unavailable",
+                "note": "Nuclei binary is not installed in this engine image."}
+    batches = [{"label": "curated", "status": merged["status"],
+                "total": merged["total"]}]
+    all_findings = list(merged["findings"])
+    counts = dict(merged["counts"])
+    if deep:
+        cve_root = os.path.join(NUCLEI_TEMPLATES, "http", "cves")
+        years = []
+        if os.path.isdir(cve_root):
+            years = sorted((d for d in os.listdir(cve_root) if d.isdigit()),
+                           reverse=True)
+        spent = 0
+        for year in years:
+            if spent > 900:
+                batches.append({"label": f"cve-{year}",
+                                "status": "skipped_budget", "total": 0})
+                continue
+            t0 = time.time()
+            part = _run_nuclei(base_targets,
+                               [os.path.join(cve_root, year)], cookie, 200)
+            spent += int(time.time() - t0)
+            if part is None:
+                continue
+            batches.append({"label": f"cve-{year}", "status": part["status"],
+                            "total": part["total"]})
+            all_findings += part["findings"]
+            for k, v in part["counts"].items():
+                counts[k] = counts.get(k, 0) + v
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3,
+             "info": 4, "unknown": 5}
+    seen, unique = set(), []
+    for f in sorted(all_findings, key=lambda x: order.get(x["severity"], 5)):
+        key = (f.get("template"), f.get("matched_at"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(f)
+    # Counts describe the deduplicated findings the report actually lists,
+    # so the summary and the list can never disagree.
+    counts = {}
+    for f in unique:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    return {"status": "ready", "findings": unique[:100], "counts": counts,
+            "total": sum(counts.values()), "batches": batches,
+            "deep": bool(deep)}
+
+# ------------------------------------------------------------ katana crawl
+KATANA_PATH = shutil.which("katana")
+NOTABLE_WORDS = ("login", "admin", "api", "swagger", "graphql", "upload",
+                 "panel", "dashboard", ".git", "backup", "config",
+                 "phpmyadmin", "wp-admin", "console", "actuator")
+
+def katana_crawl(host: str, cookie: str = None):
+    """Bounded same-host crawl (depth 2) that discovers the pages and
+    endpoints the vulnerability scan should also cover."""
+    if not KATANA_PATH:
+        return {"status": "unavailable",
+                "note": "Katana crawler is not installed in this engine image."}
+    command = [KATANA_PATH, "-u", f"https://{host}", "-silent", "-nc",
+               "-d", "2", "-c", "10", "-rl", "30", "-timeout", "8",
+               "-retries", "1", "-jc", "-kf", "all"]
+    if cookie:
+        command += ["-H", "Cookie: " + cookie]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=150, check=False, shell=False)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "urls": [], "total": 0, "notable": []}
+    urls = []
+    for line in (result.stdout or "").splitlines():
+        u = line.strip()
+        if not u.startswith("http"):
+            continue
+        try:
+            parsed = urllib.parse.urlparse(u)
+        except Exception:
+            continue
+        if (parsed.hostname or "").lower() != host.lower():
+            continue
+        if u not in urls:
+            urls.append(u)
+        if len(urls) >= 300:
+            break
+    notable = [u for u in urls
+               if any(w in u.lower() for w in NOTABLE_WORDS)][:30]
+    return {"status": "ready", "total": len(urls), "urls": urls,
+            "notable": notable}
+
+# ------------------------------------------------------------ origin discovery
+# Cloudflare edge ranges (public, stable): addresses inside them are the
+# CDN edge, never the origin we are looking for.
+CF_V4 = ["173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+         "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+         "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+         "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+         "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22"]
+CF_NETS = [ipaddress.ip_network(c) for c in CF_V4]
+SUBDOMAIN_WORDS = ["mail", "direct", "origin", "server", "ftp", "cpanel",
+                   "webmail", "www2", "backend", "host", "portal", "mx"]
+
+def _is_cloudflare(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr.version == n.version and addr in n for n in CF_NETS)
+
+def _crtsh_subdomains(base: str):
+    try:
+        data = fetch_json(f"https://crt.sh/?q=%25.{base}&output=json",
+                          timeout=15)
+    except Exception:
+        return []
+    names = set()
+    if isinstance(data, list):
+        for row in data:
+            for name in str(row.get("name_value", "")).split("\n"):
+                name = name.strip().lower().lstrip("*.")
+                if name.endswith(base) and "@" not in name:
+                    names.add(name)
+    return sorted(names)[:60]
+
+def _verify_origin(ip: str, host: str) -> bool:
+    """Ask the candidate address directly, with the site's Host/SNI: if it
+    answers like the site, it very likely IS the origin server."""
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((ip, 443), timeout=6) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                tls.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                            "Connection: close\r\n\r\n".encode())
+                data = tls.recv(1024).decode("utf-8", "replace")
+                return data.startswith("HTTP/")
+    except Exception:
+        return False
+
+def origin_discovery(host: str):
+    """Passive origin hunt: certificate-transparency subdomains plus the
+    usual direct/mail subdomains, filtered to non-Cloudflare addresses."""
+    base = host[4:] if host.startswith("www.") else host
+    subs = set(_crtsh_subdomains(base))
+    subs |= {f"{w}.{base}" for w in SUBDOMAIN_WORDS}
+    found = {}
+    for sub in sorted(subs):
+        try:
+            infos = socket.getaddrinfo(sub, None, proto=socket.IPPROTO_TCP)
+        except Exception:
+            continue
+        for info in infos:
+            ip = info[4][0]
+            try:
+                if not ipaddress.ip_address(ip).is_global:
+                    continue
+            except ValueError:
+                continue
+            if not _is_cloudflare(ip):
+                found.setdefault(ip, []).append(sub)
+    candidates = []
+    for ip, names in list(found.items())[:5]:
+        candidates.append({"ip": ip, "via_subdomains": names[:4],
+                           "serves_site": _verify_origin(ip, host)})
+    return {"status": "ready", "base_domain": base,
+            "subdomains_checked": len(subs), "candidates": candidates,
+            "note": "Candidates are non-Cloudflare addresses of related "
+                    "subdomains; serves_site means the address answered "
+                    "for this site when asked directly."}
+
 
 @app.post("/scans/web")
 def web_scan(request: WebScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
     require_auth(authorization)
     if not request.confirm_authorized: raise HTTPException(status_code=400, detail="Explicit authorization confirmation is required.")
     host, ips = check_web_target(request.target_host, x_scan_approval)
+    crawl = katana_crawl(host, request.auth_cookie) if request.deep else {"status": "skipped"}
+    extra = crawl.get("urls") if crawl.get("status") == "ready" else None
+    origin = origin_discovery(host) if request.deep else {"status": "skipped"}
     return {"status": "completed", "target": host, "resolved_ips": ips,
             "authorization_reference": request.authorization_reference,
-            "profile": "approved-web-assessment-v1",
+            "profile": "approved-web-assessment-v2" if request.deep else "approved-web-assessment-v1",
+            "deep": bool(request.deep), "authenticated": bool(request.auth_cookie),
             "dns": dns_records(host), "http": http_probe(host),
-            "tls": tls_probe(host), "nuclei": nuclei_scan(host),
+            "tls": tls_probe(host),
+            "nuclei": nuclei_scan(host, deep=request.deep,
+                                  cookie=request.auth_cookie,
+                                  extra_targets=extra),
+            "crawl": {k: crawl.get(k) for k in ("status", "total", "notable", "note")},
+            "origin": origin,
             "limitations": ["Detection only: curated Nuclei templates with dos/intrusive/fuzz/brute-force tags excluded; no exploitation is attempted.",
-                            "TLS and HTTP probes are single-shot observations from the engine's network vantage point.",
-                            "Findings are scanner reports, not confirmed vulnerabilities; the admin reviews them before acting."]}
+                            "Deep mode adds the full CVE template tree in per-year batches and a depth-2 crawl; findings remain scanner reports for the admin to review.",
+                            "Origin candidates are passive discoveries (certificate transparency + related subdomains), verified by a direct request; a well-hidden origin may not appear.",
+                            "An authenticated scan uses only the test-account session the owner supplied for this scan; it is never stored."]}
