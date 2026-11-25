@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.7.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.8.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -781,3 +781,311 @@ def origin_scan(request: OriginScanRequest, authorization: Optional[str] = Heade
             "limitations": ["The web assessment is served by the origin address directly (Host/SNI identity of the site); public DNS data is shown for reference only.",
                             "Detection only, identical guardrails to the standard web assessment; no exploitation is attempted.",
                             "For ports and services on the same server, run the standard IP scan on the origin address."]}
+
+# ------------------------------------------------- full attack-surface assessment
+class FullScanRequest(BaseModel):
+    target_host: str
+    authorization_reference: str = Field(min_length=4, max_length=120)
+    confirm_authorized: bool
+
+def valid_full_permit(value: Optional[str], host: str, ips) -> bool:
+    if not value or not PERMIT_SECRET: return False
+    try:
+        payload, signature = value.split(".", 1)
+        expected = hmac.new(PERMIT_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        if not hmac.compare_digest(expected, supplied): return False
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return (data.get("kind") == "full" and data.get("host") == host
+                and bool(data.get("id")) and isinstance(data.get("exp"), (int, float))
+                and data["exp"] > time.time() * 1000
+                and set(data.get("ips") or []) >= set(ips))
+    except Exception: return False
+
+def check_full_target(value: str, permit: Optional[str] = None):
+    host = normalize_host(value)
+    ips = resolve_host_ips(host)
+    if not valid_full_permit(permit, host, ips):
+        raise HTTPException(status_code=403, detail="Target requires an active admin approval bound to this host and its resolved addresses.")
+    if NETWORKS:
+        for ip in ips:
+            address = ipaddress.ip_address(ip)
+            if not any(address.version == net.version and address in net for net in NETWORKS):
+                raise HTTPException(status_code=403, detail="Target is outside the engine's authorized CIDR restrictions.")
+    return host, ips
+
+DISCOVERY_WORDS = ["www", "mail", "webmail", "portal", "app", "api", "dev",
+                   "staging", "test", "admin", "vpn", "remote", "shop",
+                   "blog", "support", "help", "cloud", "secure", "login",
+                   "cpanel", "ftp", "mx", "ns1", "ns2", "direct", "origin",
+                   "server", "backend", "host", "www2", "m", "beta", "old"]
+
+def _resolve_quiet(host):
+    """Resolve a hostname to its global IPs, or [] — discovery helper
+    that never raises and never returns non-public addresses."""
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return []
+    ips = sorted({info[4][0] for info in infos})
+    out = []
+    for ip in ips:
+        try:
+            if ipaddress.ip_address(ip).is_global:
+                out.append(ip)
+        except ValueError:
+            continue
+    return out
+
+def discover_subdomains(base: str):
+    """Passive subdomain discovery: certificate-transparency names plus
+    a bounded wordlist of names that actually resolve. Returns the
+    sorted candidate hostnames (base itself excluded)."""
+    names = set(_crtsh_subdomains(base))
+    for word in DISCOVERY_WORDS:
+        candidate = f"{word}.{base}"
+        if candidate not in names and _resolve_quiet(candidate):
+            names.add(candidate)
+    names.discard(base)
+    return sorted(names)[:40]
+
+DKIM_SELECTORS = ["google", "selector1", "selector2", "default", "mail",
+                  "k1", "s1", "smtp", "dkim", "mandrill", "amazonses",
+                  "protonmail", "zoho", "yandex"]
+
+def _txt_records(resolver, name):
+    try:
+        answers = resolver.resolve(name, "TXT")
+        return ["".join(part.decode() if isinstance(part, bytes) else part
+                         for part in r.strings) if hasattr(r, "strings")
+                else str(r).strip('"') for r in answers]
+    except Exception:
+        return []
+
+def email_security(domain: str):
+    """SPF / DMARC / DKIM-selector audit from public DNS only."""
+    if dns is None:
+        return {"status": "unavailable",
+                "note": "dnspython not installed in this engine image."}
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 4
+    resolver.lifetime = 6
+    try:
+        mx = sorted(str(r) for r in resolver.resolve(domain, "MX"))
+    except Exception:
+        mx = []
+    out = {"status": "ready", "has_mx": bool(mx), "mx": mx[:5]}
+    spf_records = [t for t in _txt_records(resolver, domain)
+                   if t.lower().startswith("v=spf1")]
+    if spf_records:
+        record = spf_records[0]
+        tail = record.lower().rsplit("all", 1)[-1] if "all" in record.lower() else ""
+        if "-all" in record.lower():
+            strength = "strict"
+        elif "~all" in record.lower():
+            strength = "softfail"
+        else:
+            strength = "weak"
+        out["spf"] = {"present": True, "record": record[:250],
+                      "strength": strength}
+    else:
+        out["spf"] = {"present": False}
+    dmarc_records = [t for t in _txt_records(resolver, f"_dmarc.{domain}")
+                     if "v=dmarc1" in t.lower().replace(" ", "")]
+    if dmarc_records:
+        record = dmarc_records[0]
+        m = re.search(r"p\s*=\s*(none|quarantine|reject)", record.lower())
+        out["dmarc"] = {"present": True, "record": record[:250],
+                        "policy": m.group(1) if m else "unknown"}
+    else:
+        out["dmarc"] = {"present": False}
+    found = []
+    for selector in DKIM_SELECTORS:
+        name = f"{selector}._domainkey.{domain}"
+        if _txt_records(resolver, name):
+            found.append(selector)
+            continue
+        try:
+            resolver.resolve(name, "CNAME")
+            found.append(selector)
+        except Exception:
+            pass
+    out["dkim"] = {"selectors_checked": len(DKIM_SELECTORS), "found": found}
+    return out
+
+COOKIE_FRAMEWORK_HINTS = (
+    ("phpsessid", "PHP"), ("jsessionid", "Java"),
+    ("asp.net_sessionid", "ASP.NET"), ("aspsessionid", "ASP.NET"),
+    ("csrftoken", "Django"), ("laravel_session", "Laravel"),
+    ("wordpress_", "WordPress"), ("wp-settings", "WordPress"),
+    ("x-id-", "Amazon"), ("session-id", "Amazon"),
+)
+
+def tech_fingerprint(http_result):
+    """Conservative technology hints from response headers and cookie
+    names only — labelled as hints, never as certainties."""
+    hints = []
+    server = http_result.get("server")
+    powered = http_result.get("powered_by")
+    if server:
+        hints.append(f"خادم ويب: {server}")
+    if powered:
+        hints.append(f"تقنية معلنة: {powered}")
+    for cookie in http_result.get("cookies") or []:
+        name = (cookie.get("name") or "").lower()
+        for marker, label in COOKIE_FRAMEWORK_HINTS:
+            if marker in name and f"إطار/منصة محتملة: {label}" not in hints:
+                hints.append(f"إطار/منصة محتملة: {label}")
+    return {"server": server, "powered_by": powered, "hints": hints}
+
+RISKY_PORTS = {21: "FTP", 23: "Telnet", 2323: "Telnet-alt", 3389: "RDP",
+               5900: "VNC", 6379: "Redis", 27017: "MongoDB",
+               2375: "Docker API", 2376: "Docker API"}
+DB_PORTS = {3306: "MySQL", 5432: "PostgreSQL", 1433: "MSSQL",
+            9200: "Elasticsearch", 11211: "Memcached", 5984: "CouchDB"}
+
+def full_score(hosts, ports_by_ip, email):
+    """Transparent 0-100 posture score: every deduction is listed so
+    the report can show exactly why the score is what it is."""
+    score = 100
+    deductions = []
+
+    def deduct(points, label, cap_bucket, caps):
+        if caps.get(cap_bucket, 0) >= caps["_caps"][cap_bucket]:
+            return
+        take = min(points, caps["_caps"][cap_bucket] - caps.get(cap_bucket, 0))
+        if take <= 0:
+            return
+        caps[cap_bucket] = caps.get(cap_bucket, 0) + take
+        nonlocal_score[0] -= take
+        deductions.append({"points": take, "label": label})
+
+    caps = {"_caps": {"nuclei": 40, "tls": 16, "headers": 12,
+                      "ports": 24, "email": 22}}
+    nonlocal_score = [score]
+    sev_points = {"critical": (15, "نتيجة Nuclei حرجة"), "high": (8, "نتيجة Nuclei عالية"),
+                  "medium": (3, "نتيجة Nuclei متوسطة"), "low": (1, "نتيجة Nuclei منخفضة")}
+    for host in hosts:
+        nuc = host.get("nuclei") or {}
+        for sev, count in (nuc.get("counts") or {}).items():
+            if sev in sev_points and count:
+                pts, label = sev_points[sev]
+                deduct(pts * count, f"{label} على {host['host']} (×{count})",
+                       "nuclei", caps)
+        http = host.get("http") or {}
+        tls = host.get("tls") or {}
+        if http.get("status") == "ready":
+            missing = len(http.get("missing") or [])
+            if missing >= 4:
+                deduct(4, f"ترويسات أمان ناقصة ({missing}) على {host['host']}",
+                       "headers", caps)
+            elif missing >= 2:
+                deduct(2, f"ترويسات أمان ناقصة ({missing}) على {host['host']}",
+                       "headers", caps)
+            if http.get("scheme") == "http" and tls.get("status") != "ready":
+                deduct(4, f"{host['host']} يخدم HTTP بلا TLS", "tls", caps)
+        if tls.get("status") == "ready":
+            legacy = [k for k, v in (tls.get("legacy_protocols") or {}).items() if v]
+            if legacy:
+                deduct(6, f"بروتوكولات TLS قديمة على {host['host']}: {', '.join(legacy)}",
+                       "tls", caps)
+            days = tls.get("days_left")
+            if days is not None and days < 15:
+                deduct(5, f"شهادة {host['host']} تنتهي بعد {days} يوماً",
+                       "tls", caps)
+    for entry in ports_by_ip:
+        for port in entry.get("ports") or []:
+            if port.get("state") != "open":
+                continue
+            try:
+                number = int(port.get("port"))
+            except (TypeError, ValueError):
+                continue
+            if number in RISKY_PORTS:
+                deduct(6, f"منفذ حساس مفتوح {number} ({RISKY_PORTS[number]}) على {entry['ip']}",
+                       "ports", caps)
+            elif number in DB_PORTS:
+                deduct(3, f"منفذ قاعدة بيانات مفتوح {number} ({DB_PORTS[number]}) على {entry['ip']}",
+                       "ports", caps)
+    if email.get("status") == "ready" and email.get("has_mx"):
+        spf = email.get("spf") or {}
+        dmarc = email.get("dmarc") or {}
+        if not spf.get("present"):
+            deduct(8, "لا سجل SPF — انتحال البريد ممكن", "email", caps)
+        elif spf.get("strength") in ("softfail", "weak"):
+            deduct(4, "سجل SPF ضعيف الإنهاء (ليس -all)", "email", caps)
+        if not dmarc.get("present"):
+            deduct(8, "لا سجل DMARC — لا حماية من انتحال النطاق", "email", caps)
+        elif dmarc.get("policy") == "none":
+            deduct(4, "سياسة DMARC عند p=none (مراقبة فقط)", "email", caps)
+        if not (email.get("dkim") or {}).get("found"):
+            deduct(2, "لم يُعثر على مفاتيح DKIM للمحددات الشائعة المفحوصة",
+                   "email", caps)
+    final = max(0, nonlocal_score[0])
+    grade = ("ممتاز" if final >= 90 else "جيد" if final >= 75 else
+             "متوسط" if final >= 55 else "ضعيف" if final >= 35 else "حرج")
+    deductions.sort(key=lambda d: -d["points"])
+    return {"score": final, "grade": grade, "deductions": deductions[:12]}
+
+@app.post("/scans/full")
+def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
+    require_auth(authorization)
+    if not request.confirm_authorized: raise HTTPException(status_code=400, detail="Explicit authorization confirmation is required.")
+    host, ips = check_full_target(request.target_host, x_scan_approval)
+    started = time.time()
+    base = host[4:] if host.startswith("www.") else host
+
+    discovered = discover_subdomains(base)
+    candidates = []
+    for name in [host, base] + discovered:
+        if name not in candidates:
+            candidates.append(name)
+    assessed, all_ips = [], []
+    for name in candidates[:10]:
+        resolved = _resolve_quiet(name)
+        if not resolved:
+            continue
+        for ip in resolved:
+            if ip not in all_ips:
+                all_ips.append(ip)
+        http = http_probe(name)
+        tls = tls_probe(name) if http.get("status") == "ready" else {"status": "skipped"}
+        assessed.append({"host": name, "ips": resolved, "http": http,
+                         "tls": tls, "tech": tech_fingerprint(http),
+                         "nuclei": {"status": "skipped"}})
+    live = [h for h in assessed if (h.get("http") or {}).get("status") == "ready"]
+    nuclei_done = 0
+    for entry in live:
+        if nuclei_done >= 3 or time.time() - started > 1000:
+            entry["nuclei"] = {"status": "skipped_budget"}
+            continue
+        entry["nuclei"] = nuclei_scan(entry["host"], deep=False)
+        nuclei_done += 1
+    ports_by_ip = []
+    for ip in all_ips[:4]:
+        if time.time() - started > 1250:
+            break
+        try:
+            data = nmap_data(ip, 100)
+            ports_by_ip.append({"ip": ip, "ports": data["ports"],
+                                "summary": data["summary"]})
+        except HTTPException as exc:
+            ports_by_ip.append({"ip": ip, "ports": [],
+                                "error": exc.detail})
+    email = email_security(base)
+    score = full_score(assessed, ports_by_ip, email)
+    priorities = [d["label"] for d in score["deductions"][:8]]
+    return {"status": "completed", "target": host, "base_domain": base,
+            "resolved_ips": ips,
+            "authorization_reference": request.authorization_reference,
+            "profile": "approved-full-assessment-v1",
+            "elapsed_seconds": int(time.time() - started),
+            "discovery": {"subdomains_found": discovered,
+                          "hosts_assessed": [h["host"] for h in assessed]},
+            "dns": dns_records(host),
+            "hosts": assessed, "ports_by_ip": ports_by_ip,
+            "email": email, "score": score, "priorities": priorities,
+            "limitations": ["Detection only: identical guardrails to the web assessment (curated Nuclei templates, no intrusive tags, no exploitation).",
+                            "Discovery is passive (certificate transparency + resolving wordlist); subdomains that exist but are neither in CT logs nor in the wordlist will not appear.",
+                            "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, within one time budget; anything beyond is reported as skipped, never silently dropped.",
+                            "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification."]}
