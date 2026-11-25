@@ -66,6 +66,10 @@ CATALOG_NOTE = (
     "العامة المرتبطة بالرقم: تيليجرام عبر اكتشافه الرسمي (يظهر فقط من سمح "
     "بالعثور عليه برقمه في إعداداته)؛ واتساب وسيغنال لا يوفران تحققاً "
     "عاماً موثوقاً من الأرقام فلا تُعرض لهما نتائج مختلقة. "
+    "(7) تقييم شامل لمنظومة (EASM): من نطاق واحد — اكتشاف ساكن للنطاقات "
+    "الفرعية، فحص منافذ لأهم الخوادم، تقييم ويب (Nuclei + TLS + ترويسات) "
+    "لأهم المواقع الحية، بصمات تقنية، تدقيق أمان بريد (SPF/DKIM/DMARC)، "
+    "ودرجة أمان موحدة 0-100 بخصومات معلنة الأسباب وأولويات إصلاح. "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -366,6 +370,32 @@ def run_approved_web_scan(req):
     }, permit=permit, timeout=1500 if deep else 900)
 
 
+def create_full_permit(host: str, ips, request_id: str, expires_ms: int) -> str:
+    """Domain + resolved-address-set bound permit for the full
+    attack-surface assessment; verified by the engine's
+    valid_full_permit(). Same HMAC scheme as create_web_permit()."""
+    if not PERMIT_SECRET:
+        raise RuntimeError("SCAN_APPROVAL_SECRET is not configured")
+    payload = _b64url(json.dumps(
+        {"host": host, "ips": list(ips), "kind": "full",
+         "id": request_id, "exp": expires_ms},
+        separators=(",", ":")).encode())
+    signature = _b64url(hmac.new(
+        PERMIT_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    return payload + "." + signature
+
+
+def run_approved_full_scan(req):
+    ips = resolve_host_ips(req["ip"])
+    permit = create_full_permit(req["ip"], ips, req["id"],
+                                int(time.time() * 1000) + PERMIT_TTL_MS)
+    return engine_call("POST", "/scans/full", body={
+        "target_host": req["ip"],
+        "authorization_reference": req["auth_ref"],
+        "confirm_authorized": True,
+    }, permit=permit, timeout=1800)
+
+
 SEV_AR = {"critical": "حرجة", "high": "عالية", "medium": "متوسطة",
           "low": "منخفضة", "info": "معلومة", "unknown": "غير مصنفة"}
 
@@ -461,6 +491,117 @@ def format_web_report(req, result, origin_ip=None) -> str:
     return "\n".join(lines)
 
 
+def format_full_report(req, result) -> str:
+    base = result.get("base_domain", req["ip"])
+    score = result.get("score") or {}
+    lines = [f"🏢 اكتمل التقييم الشامل للمنظومة {base}",
+             f"المرجع: {req['auth_ref']}  |  الملف: {result.get('profile','')}"]
+    if result.get("elapsed_seconds") is not None:
+        lines.append(f"مدة التقييم: {result['elapsed_seconds']} ثانية")
+    lines.append(f"\n🏆 درجة الأمان الإجمالية: {score.get('score', '?')}/100 "
+                 f"({score.get('grade', '')})")
+    deductions = score.get("deductions") or []
+    if deductions:
+        lines.append("أسباب الخصم:")
+        for d in deductions[:8]:
+            lines.append(f"  −{d.get('points')}: {d.get('label')}")
+    priorities = result.get("priorities") or []
+    if priorities:
+        lines.append("\n🚨 أولويات الإصلاح:")
+        for i, p in enumerate(priorities[:8], 1):
+            lines.append(f"{i}. {p}")
+    discovery = result.get("discovery") or {}
+    subs = discovery.get("subdomains_found") or []
+    lines.append(f"\n🔭 الاكتشاف: {len(subs)} نطاقاً فرعياً مكتشفاً ساكناً، "
+                 f"و{len(discovery.get('hosts_assessed') or [])} مضيفاً قُيّم فعلياً")
+    for s in subs[:15]:
+        lines.append(f"  • {s}")
+    if len(subs) > 15:
+        lines.append(f"  … و{len(subs) - 15} أخرى")
+    email = result.get("email") or {}
+    if email.get("status") == "ready":
+        lines.append("\n📧 أمان البريد:")
+        if not email.get("has_mx"):
+            lines.append("  لا سجلات MX — النطاق لا يستقبل بريداً (بنود "
+                         "SPF/DMARC لا تنطبق عملياً)")
+        spf = email.get("spf") or {}
+        if spf.get("present"):
+            strength = {"strict": "صارم (-all)", "softfail": "لين (~all)",
+                        "weak": "ضعيف الإنهاء"}.get(spf.get("strength"),
+                                                    spf.get("strength"))
+            lines.append(f"  SPF: موجود — {strength}")
+        elif email.get("has_mx"):
+            lines.append("  SPF: ❌ غائب — أي شخص يستطيع إرسال بريد منتحلاً نطاقك")
+        dmarc = email.get("dmarc") or {}
+        if dmarc.get("present"):
+            lines.append(f"  DMARC: موجود — السياسة p={dmarc.get('policy')}")
+        elif email.get("has_mx"):
+            lines.append("  DMARC: ❌ غائب — لا حماية من انتحال النطاق")
+        dkim = email.get("dkim") or {}
+        if dkim.get("found"):
+            lines.append(f"  DKIM: مفاتيح معلنة للمحددات: {', '.join(dkim['found'])}")
+        elif email.get("has_mx"):
+            lines.append(f"  DKIM: لم يُعثر على مفاتيح بين {dkim.get('selectors_checked')} "
+                         "محدداً شائعاً فُحص")
+    hosts = result.get("hosts") or []
+    if hosts:
+        lines.append("\n🖥️ المضيفون المقيّمون:")
+    for h in hosts:
+        http = h.get("http") or {}
+        head = f"\n▸ {h.get('host')} ({'، '.join(h.get('ips') or [])})"
+        lines.append(head)
+        if http.get("status") == "ready":
+            lines.append(f"  HTTP {http.get('http_status')} عبر {http.get('scheme')} "
+                         f"| ترويسات الأمان: {http.get('score', '?')}")
+        else:
+            lines.append("  HTTP: لا خدمة ويب مستجيبة")
+        tech = (h.get("tech") or {}).get("hints") or []
+        for hint in tech[:3]:
+            lines.append(f"  🔧 {hint}")
+        tls = h.get("tls") or {}
+        if tls.get("status") == "ready":
+            legacy = [k for k, v in (tls.get("legacy_protocols") or {}).items() if v]
+            lines.append(f"  TLS: {tls.get('tls_version')} | تنتهي الشهادة بعد "
+                         f"{tls.get('days_left')} يوم"
+                         + (f" | ⚠️ قديمة: {', '.join(legacy)}" if legacy else ""))
+        nuc = h.get("nuclei") or {}
+        if nuc.get("status") == "ready":
+            counts = nuc.get("counts") or {}
+            if counts:
+                lines.append("  نتائج Nuclei: " + "، ".join(
+                    f"{SEV_AR.get(k, k)}: {v}" for k, v in counts.items()))
+                for f in (nuc.get("findings") or [])[:5]:
+                    lines.append(f"    • [{SEV_AR.get(f.get('severity'), f.get('severity'))}] "
+                                 f"{f.get('name')} — {f.get('matched_at')}")
+            else:
+                lines.append("  نتائج Nuclei: لا شيء ضمن القوالب المحدودة")
+        elif nuc.get("status") == "skipped_budget":
+            lines.append("  نتائج Nuclei: تخطّت ميزانية الوقت (مُعلن، غير مُسقط بصمت)")
+        elif nuc.get("status") not in ("skipped", None):
+            lines.append(f"  نتائج Nuclei: {nuc.get('status')}")
+    ports_by_ip = result.get("ports_by_ip") or []
+    if ports_by_ip:
+        lines.append("\n🔌 المنافذ (أشهر 100 لكل خادم):")
+    for entry in ports_by_ip:
+        open_ports = [p for p in (entry.get("ports") or [])
+                      if p.get("state") == "open"]
+        if entry.get("error"):
+            lines.append(f"  {entry['ip']}: تعذّر فحص المنافذ ({entry['error']})")
+        elif open_ports:
+            lines.append(f"  {entry['ip']}:")
+            for p in open_ports[:12]:
+                svc = " ".join(x for x in [p.get("service"), p.get("product"),
+                                           p.get("version")] if x)
+                lines.append(f"    • {p.get('port')}/{p.get('protocol')} — {svc}")
+        else:
+            lines.append(f"  {entry['ip']}: لا منافذ مفتوحة ضمن المفحوص")
+    lines.append("\nالحدود: اكتشاف ساكن (شهادات + كلمات شائعة محلولة فعلياً)، "
+                 "حدود معلنة: حتى 10 مضيفين تُقاس طبقاتهم، 3 منهم بفحص Nuclei "
+                 "كامل، و4 عناوين بفحص منافذ — والمتجاوز يُعلن متخطّى لا يُحذف "
+                 "بصمت. الدرجة هيورستيك شفاف: كل خصم مسبّب في التقرير.")
+    return "\n".join(lines)
+
+
 def send_long(chat_id, text, reply_markup=None):
     """Send a long report as consecutive messages (Telegram caps ~4096)."""
     chunks, current = [], ""
@@ -521,6 +662,7 @@ MAIN_KB = kb([
     [("🔎 طلب فحص جديد", "new_scan")],
     [("🌐 فحص موقع شامل", "web_scan")],
     [("🎯 فحص خادم الأصل", "origin_scan")],
+    [("🏢 تقييم شامل لمنظومة", "full_scan")],
     [("🪪 بطاقة حساب تيليجرام", "tg_card")],
     [("📱 بطاقة رقم هاتف", "phone_card")],
     [("📋 طلباتي", "my_requests"), ("🩺 حالة المحرك", "health")],
@@ -1081,6 +1223,40 @@ def handle_message(msg):
                            cookie=state.get("cookie"),
                            pass_pair=parse_pass_pair(text))
         return
+    if state and state["step"] == "f_await_host":
+        try:
+            host = validate_host(text)
+        except ValueError as exc:
+            send(chat_id, f"❌ {exc}\nأرسل اسم نطاق صحيحاً، أو /start للإلغاء.")
+            return
+        state.update(step="f_await_ref", ip=host)
+        send(chat_id, f"المنظومة: {host}\nالآن أرسل مرجع التصريح — إثبات أنك "
+                      "تملك هذا النطاق أو لديك تصريح مكتوب لتقييم منظومته.")
+        return
+    if state and state["step"] == "f_await_ref":
+        if not (4 <= len(text) <= 120):
+            send(chat_id, "❌ مرجع التصريح يجب أن يكون بين 4 و120 حرفاً. أعد الإرسال.")
+            return
+        state.update(step="f_await_proof", auth_ref=text)
+        send(chat_id, "الآن أرسل إثبات التصريح ليتحقق منه الأدمن قبل القرار: "
+                      "مستند أو صورة (لوحة النطاق/الاستضافة، تصريح مكتوب)، "
+                      "أو اكتب تفاصيل الإثبات نصاً. إن لم يوجد إثبات جاهز أرسل "
+                      "«تخطي» — وسيبقى القرار النهائي للأدمن.")
+        return
+    if state and state["step"] == "f_await_proof":
+        proof_file_id = None
+        proof_text = None
+        if msg.get("document"):
+            proof_file_id = msg["document"]["file_id"]
+            proof_text = msg.get("caption") or "مستند إثبات مرفق"
+        elif msg.get("photo"):
+            proof_file_id = msg["photo"][-1]["file_id"]
+            proof_text = msg.get("caption") or "صورة إثبات مرفقة"
+        elif text and text not in ("تخطي", "skip"):
+            proof_text = text[:1000]
+        state.update(proof_file_id=proof_file_id, proof_text=proof_text)
+        create_full_request(chat_id, user, state)
+        return
     if state and state["step"] == "tg_await_query":
         query = parse_tg_query(text)
         if not query:
@@ -1181,6 +1357,28 @@ def create_origin_request(chat_id, user, state, deep, cookie=None, pass_pair=Non
     notify_admin(req)
 
 
+def create_full_request(chat_id, user, state):
+    req = {
+        "id": uuid.uuid4().hex, "user_id": user.get("id"),
+        "username": user.get("username") or user.get("first_name", "?"),
+        "ip": state["ip"], "auth_ref": state["auth_ref"],
+        "proof_file_id": state.get("proof_file_id"),
+        "proof_text": state.get("proof_text"),
+        "top_ports": 0, "status": "pending", "kind": "full",
+        "deep": 1,
+        "created_at": time.time(),
+        "expires_at": time.time() + APPROVAL_TTL_HOURS * 3600,
+    }
+    save_request(req)
+    STATE.pop(chat_id, None)
+    send(chat_id, f"⏳ تم إنشاء طلب التقييم الشامل {req['id'][:8]} للمنظومة {req['ip']}.\n"
+                  "يشمل: اكتشاف النطاقات الفرعية + منافذ الخوادم + تقييم ويب "
+                  "للمواقع الحية + أمان البريد + درجة أمان موحدة.\n"
+                  "لن يبدأ أي فحص قبل موافقة الأدمن، وقد يستغرق بعد الاعتماد "
+                  "حتى ٣٠ دقيقة. ستصلك النتيجة هنا.")
+    notify_admin(req)
+
+
 def show_health(chat_id):
     try:
         health = engine_call("GET", "/health")
@@ -1212,7 +1410,12 @@ def notify_admin(req):
     is_web = kind in ("web", "origin")
     extras = (" + جلسة حساب اختبار" if AUTH_SECRETS.get(req["id"]) else "") + \
              (" + بصمة مرور" if PASS_SECRETS.get(req["id"]) else "")
-    if kind == "origin":
+    if kind == "full":
+        title = "🔔 طلب تقييم شامل لمنظومة بانتظار قرارك\n"
+        scope_line = ("النوع: تقييم شامل 🏢 (اكتشاف نطاقات فرعية + منافذ + "
+                      "ويب لكل مضيف حي + بريد + درجة أمان)")
+        target_line = f"النطاق: {req['ip']}"
+    elif kind == "origin":
         title = "🔔 طلب فحص خادم أصل بانتظار قرارك\n"
         scope_line = ("النوع: فحص أصل عميق 🔬 (CVE كاملة + ويب على الأصل مباشرة)"
                       if req.get("deep") else
@@ -1274,6 +1477,15 @@ def handle_callback(cb):
                       "Cloudflare.\nأرسل اسم نطاق الموقع (مثال: example.com).\n"
                       "تنبيه: لا ترسل إلا موقعاً تملكه أو لديك تصريح مكتوب لفحصه، "
                       "وعنوان أصله يزوّده مالكه.")
+    elif data == "full_scan":
+        STATE[chat_id] = {"step": "f_await_host"}
+        send(chat_id, "🏢 تقييم شامل لمنظومة كاملة من نطاق واحد: اكتشاف "
+                      "النطاقات الفرعية + فحص منافذ الخوادم + تقييم ويب "
+                      "للمواقع الحية (ثغرات + TLS + ترويسات) + تدقيق أمان "
+                      "البريد (SPF/DKIM/DMARC) + درجة أمان موحدة وأولويات "
+                      "إصلاح.\nأرسل النطاق الرئيسي (مثال: example.com).\n"
+                      "تنبيه: لا ترسل إلا نطاقاً تملكه أو لديك تصريح مكتوب "
+                      "لتقييمه، والتقييم قد يستغرق حتى ٣٠ دقيقة بعد اعتماد الأدمن.")
     elif data == "tg_card":
         STATE[chat_id] = {"step": "tg_await_query"}
         send(chat_id, "🪪 بطاقة حساب تيليجرام: أرسل المعرف (@username) أو "
@@ -1366,11 +1578,16 @@ def handle_callback(cb):
         is_web = kind in ("web", "origin")
         send(chat_id, f"✅ اعتمدت {rid[:8]}، جارٍ الفحص…")
         send(req["user_id"], f"🔄 بدأ فحص {req['ip']}، "
-             + ("العميق قد يستغرق حتى ٢٥ دقيقة…" if is_web and req.get("deep")
+             + ("التقييم الشامل قد يستغرق حتى ٣٠ دقيقة…" if kind == "full"
+                else "العميق قد يستغرق حتى ٢٥ دقيقة…" if is_web and req.get("deep")
                 else "قد يستغرق حتى عشر دقائق…" if is_web
                 else "قد يستغرق حتى دقيقتين…"))
         try:
-            if kind == "origin":
+            if kind == "full":
+                result = run_approved_full_scan(req)
+                transition(rid, "scanning", "completed", result=json.dumps(result))
+                send_long(req["user_id"], format_full_report(req, result), MAIN_KB)
+            elif kind == "origin":
                 result = run_approved_origin_scan(req)
                 transition(rid, "scanning", "completed", result=json.dumps(result))
                 send_long(req["user_id"], format_web_report(
