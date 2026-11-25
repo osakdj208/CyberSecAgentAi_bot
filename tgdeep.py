@@ -98,6 +98,76 @@ async def _resolve_async(query):
         await client.disconnect()
 
 
+async def _phone_async(phone):
+    """Resolve a phone number to its PUBLIC Telegram profile, using the
+    platform's own contact-discovery mechanism. Telegram only returns a
+    user when the number's owner allows being found by number; otherwise
+    the import comes back empty — the owner's privacy setting decides.
+    The imported contact is deleted again immediately; the dedicated
+    account keeps no address book. The number itself is never returned
+    (the caller already has it — they typed it)."""
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.tl.functions.contacts import (DeleteContactsRequest,
+                                                ImportContactsRequest)
+    from telethon.tl.types import InputPhoneContact
+
+    client = TelegramClient(
+        StringSession(os.environ["TG_SESSION"]),
+        int(os.environ["TG_API_ID"]),
+        os.environ["TG_API_HASH"])
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            return {"error": "session_not_authorized"}
+        result = await client(ImportContactsRequest(
+            [InputPhoneContact(client_id=1, phone=phone,
+                               first_name="Card", last_name="")]))
+        users = list(getattr(result, "users", []) or [])
+        if not users:
+            return {"found": False}
+        user = users[0]
+        info = {"found": True,
+                "id": user.id,
+                "username": getattr(user, "username", None),
+                "is_bot": bool(getattr(user, "bot", False)),
+                "verified": bool(getattr(user, "verified", False)),
+                "scam": bool(getattr(user, "scam", False)),
+                "fake": bool(getattr(user, "fake", False)),
+                "name": " ".join(
+                    x for x in [getattr(user, "first_name", None),
+                                getattr(user, "last_name", None)] if x) or None}
+        try:
+            await client(DeleteContactsRequest([user]))
+        except Exception:
+            pass
+        return info
+    finally:
+        await client.disconnect()
+
+
+def phone_lookup(phone):
+    """Phone -> public Telegram profile (or {"found": False}). Same
+    contract as deep_lookup: None when not configured, in-band errors."""
+    if not configured():
+        return None
+    global _last_call
+    with _lock:
+        wait = MIN_INTERVAL - (time.time() - _last_call)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            result = asyncio.run(_phone_async(phone))
+        except Exception as exc:  # telethon errors included
+            name = type(exc).__name__
+            if "FloodWait" in name:
+                result = {"error": "flood"}
+            else:
+                result = {"error": name}
+        _last_call = time.time()
+        return result
+
+
 def deep_lookup(query):
     """Resolve a parsed card query via MTProto. Returns a dict, or None
     when deep lookup is not configured. Errors are reported in-band as
