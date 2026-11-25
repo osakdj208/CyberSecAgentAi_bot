@@ -77,6 +77,13 @@ CATALOG_NOTE = (
     "خطيرة ومكوّنات مكشوفة وأعلام خطرة (تصحيح/HTTP واضح/نسخ احتياطي) "
     "وأنماط أسرار مدمجة وروابط ومكتبات وشهادة توقيع — بلا تثبيت أو "
     "تشغيل، وبتصريح مرتبط ببصمة SHA-256 للملف نفسه. "
+    "(10) فحص تبعيات مشروع (SCA): ملف قفل تبعيات "
+    "(requirements.txt/Pipfile.lock/package-lock.json/yarn.lock/go.mod/"
+    "Gemfile.lock/composer.lock) يُطابَق مع OSV.dev — ثغرات معروفة "
+    "بدرجات CVSS وأول إصدار مُصلِح، وبتصريح مرتبط ببصمة الملف. "
+    "وداخل التقييم الشامل أيضاً: كشف استيلاء النطاقات الفرعية، تدقيق "
+    "DNS عميق (AXFR/DNSSEC/CAA)، فحص API وGraphQL، تعدين JavaScript، "
+    "وكشف التخزين السحابي المكشوف (S3/GCS/Azure). "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -513,6 +520,108 @@ def engine_apk_call(data: bytes, permit: str):
         raise RuntimeError(f"محرك التطبيقات رفض الملف ({exc.code}): {detail}") from exc
 
 
+SCA_SUPPORTED_NAMES = ("requirements.txt", "pipfile.lock",
+                       "package-lock.json", "yarn.lock", "go.mod",
+                       "gemfile.lock", "composer.lock")
+
+
+def create_sca_permit(sha256: str, request_id: str, expires_ms: int) -> str:
+    """Same file-bound permit pattern as the APK engine: the SCA
+    engine re-hashes the uploaded bytes and requires an exact match."""
+    if not PERMIT_SECRET:
+        raise RuntimeError("SCAN_APPROVAL_SECRET is not configured")
+    payload = _b64url(json.dumps(
+        {"sha256": sha256, "kind": "sca",
+         "id": request_id, "exp": expires_ms},
+        separators=(",", ":")).encode())
+    signature = _b64url(hmac.new(
+        PERMIT_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    return payload + "." + signature
+
+
+def download_dep_bytes(file_id):
+    info = tg("getFile", file_id=file_id)
+    path = (info.get("result") or {}).get("file_path")
+    if not path:
+        raise RuntimeError("تعذّر جلب مسار الملف من تيليجرام.")
+    url = f"https://api.telegram.org/file/bot{TOKEN}/{path}"
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "CyberSecurityAI-Agent/0.12"})
+    with urllib.request.urlopen(request, timeout=60) as resp:
+        data = resp.read(10 * 1024 * 1024 + 1)
+    if len(data) > 10 * 1024 * 1024:
+        raise RuntimeError("حجم ملف التبعيات يتجاوز حد التحليل (10MB).")
+    return data
+
+
+def engine_sca_call(data: bytes, filename: str, permit: str):
+    if not ENGINE_URL or not ENGINE_TOKEN:
+        raise RuntimeError("المحرك غير مربوط بعد: ENGINE_URL / ENGINE_API_TOKEN غير مضبوطة.")
+    request = urllib.request.Request(
+        ENGINE_URL + "/scans/sca", data=data, method="POST",
+        headers={"Authorization": f"Bearer {ENGINE_TOKEN}",
+                 "X-Scan-Approval": permit,
+                 "X-Dependency-Filename": filename,
+                 "Content-Type": "application/octet-stream"})
+    try:
+        with urllib.request.urlopen(request, timeout=300) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"محرك التبعيات رفض الملف ({exc.code}): {detail}") from exc
+
+
+def sca_analyze(filename: str, data: bytes):
+    digest = hashlib.sha256(data).hexdigest()
+    permit = create_sca_permit(digest, uuid.uuid4().hex[:12],
+                               int((time.time() + 600) * 1000))
+    return engine_sca_call(data, filename, permit)
+
+
+def format_sca_report(result) -> str:
+    if result.get("status") == "unavailable":
+        return ("📦 تعذّر إكمال فحص التبعيات: قاعدة OSV.dev لم تُجب. "
+                "حاول لاحقاً — لم تُحتسب أي نتيجة.")
+    lines = [f"📦 فحص تبعيات المشروع — {result.get('filename')}",
+             f"النظام البيئي: {result.get('ecosystem')} | "
+             f"حزم مفحوصة: {result.get('packages_checked')}"]
+    if result.get("status") == "empty" or not result.get("packages_checked"):
+        lines.append("لم أجد أي تبعية مثبّتة بإصدار دقيق داخل الملف. "
+                     "أرسل ملف قفل (lockfile) لا ملف متطلبات بمديات.")
+        return "\n".join(lines)
+    score = result.get("score") or {}
+    lines.append(f"\n🏆 درجة التبعيات: {score.get('score', '?')}/100 "
+                 f"({score.get('grade', '')})")
+    counts = result.get("counts") or {}
+    shown = [f"{k}: {v}" for k, v in counts.items() if v]
+    lines.append(f"إجمالي الثغرات المعروفة: {result.get('total_vulns', 0)}"
+                 + (f" ({'، '.join(shown)})" if shown else ""))
+    vulnerable = result.get("vulnerable") or []
+    if not vulnerable:
+        lines.append("\n✅ لا ثغرات معروفة في OSV.dev لهذه الإصدارات "
+                     "المثبّتة وقت الفحص.")
+    for pkg in vulnerable[:12]:
+        lines.append(f"\n▸ {pkg.get('name')} @ {pkg.get('version')}")
+        for v in (pkg.get("vulns") or [])[:4]:
+            head = f"  • {v.get('id')} — {v.get('severity')}"
+            if v.get("cvss") is not None:
+                head += f" (CVSS {v['cvss']})"
+            lines.append(head)
+            if v.get("summary"):
+                lines.append(f"    {v['summary']}")
+            if v.get("fixed"):
+                lines.append(f"    أول إصدار مُصلِح معلن: {v['fixed'][0]}")
+    if len(vulnerable) > 12:
+        lines.append(f"\n… و{len(vulnerable) - 12} حزمة ضعيفة أخرى لم "
+                     "تُعرض بالتفصيل.")
+    if result.get("details_capped"):
+        lines.append("تنبيه: تجاوز عدد الثغرات سقف جلب التفاصيل (25) — "
+                     "العرض التفصيلي جزئي، والعدّ الإجمالي كامل.")
+    lines.append("\nالمصدر: OSV.dev (قاعدة الثغرات المفتوحة) وقت الفحص. "
+                 "الفحص على الإصدارات المثبّتة بدقة فقط.")
+    return "\n".join(lines)
+
+
 def run_approved_unified_scan(req):
     """Unified run: the full attack-surface assessment of the domain,
     the public store card, and — since Phase B — the static analysis
@@ -731,6 +840,22 @@ def format_full_report(req, result) -> str:
             lines.append(f"  لا نطاقات معلّقة قابلة للاستيلاء بين "
                          f"{takeover.get('checked', 0)} اسماً بأسماء مستعارة "
                          "فُحصت ✅")
+    cloud = result.get("cloud") or {}
+    if cloud.get("status") == "ready":
+        lines.append("\n☁️ فحص التخزين السحابي المكشوف:")
+        exposed = cloud.get("exposed") or []
+        if exposed:
+            for b in exposed:
+                lines.append(f"  🔴 مفتوح للعامة: {b.get('name')} "
+                             f"({b.get('provider')}) — {b.get('url')} "
+                             "قائمة الملفات قابلة للقراءة دون مصادقة")
+        else:
+            lines.append(f"  لا مخازن مكشوفة بين "
+                         f"{cloud.get('candidates_checked', 0)} اسماً "
+                         "مشتقاً من النطاق فُحص على S3 وGCS وAzure ✅")
+        if cloud.get("private_existing"):
+            lines.append(f"  (وُجدت {cloud['private_existing']} مخازن "
+                         "موجودة لكنها خاصة — ليست ثغرة، معلومة فقط)")
     hosts = result.get("hosts") or []
     if hosts:
         lines.append("\n🖥️ المضيفون المقيّمون:")
@@ -985,6 +1110,7 @@ MAIN_KB = kb([
     [("🎯 فحص خادم الأصل", "origin_scan")],
     [("🏢 تقييم شامل لمنظومة", "full_scan")],
     [("🧩 فحص موحّد (موقع + تطبيق)", "uni_scan")],
+    [("📦 فحص تبعيات مشروع (SCA)", "sca_scan")],
     [("🪪 بطاقة حساب تيليجرام", "tg_card")],
     [("📱 بطاقة رقم هاتف", "phone_card")],
     [("📋 طلباتي", "my_requests"), ("🩺 حالة المحرك", "health")],
@@ -1673,6 +1799,39 @@ def handle_message(msg):
             card = f"❌ تعذّر إكمال التحقق: {exc}"
         send(chat_id, card, MAIN_KB)
         return
+    if state and state["step"] == "sca_await_file":
+        filename, data = None, None
+        if msg.get("document"):
+            doc = msg["document"]
+            name = (doc.get("file_name") or "").lower()
+            if name not in SCA_SUPPORTED_NAMES:
+                send(chat_id, "❌ اسم ملف غير مدعوم. المدعوم: " +
+                     "، ".join(SCA_SUPPORTED_NAMES) +
+                     " — أو /start للإلغاء.")
+                return
+            filename = name
+            try:
+                data = download_dep_bytes(doc["file_id"])
+            except Exception as exc:
+                STATE.pop(chat_id, None)
+                send(chat_id, f"❌ تعذّر تنزيل الملف: {exc}", MAIN_KB)
+                return
+        elif text and text.count("==") >= 2:
+            filename = "requirements.txt"
+            data = text.encode("utf-8", "replace")
+        else:
+            send(chat_id, "❌ أرسل ملف القفل كمستند، أو الصق محتوى "
+                          "requirements.txt (أسطر فيها ==)، أو /start "
+                          "للإلغاء.")
+            return
+        STATE.pop(chat_id, None)
+        send(chat_id, "🔎 جارٍ مطابقة التبعيات مع OSV.dev…")
+        try:
+            report = format_sca_report(sca_analyze(filename, data))
+        except Exception as exc:
+            report = f"❌ تعذّر إكمال فحص التبعيات: {exc}"
+        send_long(chat_id, report, MAIN_KB)
+        return
     send(chat_id, "اختر من القائمة، أو أرسل /start للبدء.", MAIN_KB)
 
 
@@ -1930,6 +2089,16 @@ def handle_callback(cb):
                       "رابط t.me أو المعرف الرقمي لحساب أو قناة أو مجموعة "
                       "عامة.\nأعرض البيانات العامة فقط: الاسم والنوع وعدد "
                       "الأعضاء والوصف العام وتقديراً تقريبياً لتاريخ الإنشاء.")
+    elif data == "sca_scan":
+        STATE[chat_id] = {"step": "sca_await_file"}
+        send(chat_id, "📦 فحص تبعيات مشروع (SCA): أرسل ملف قفل التبعيات "
+                      "لمشروعك وسأطابق كل حزمة مثبّتة مع قاعدة الثغرات "
+                      "المفتوحة OSV.dev.\nالملفات المدعومة: "
+                      "requirements.txt أو Pipfile.lock (بايثون)، "
+                      "package-lock.json أو yarn.lock (Node)، go.mod (Go)، "
+                      "Gemfile.lock (Ruby)، composer.lock (PHP).\n"
+                      "أو الصق محتوى requirements.txt نصاً مباشرة.\n"
+                      "الملف يُحلَّل ولا يُخزَّن.")
     elif data == "phone_card":
         STATE[chat_id] = {"step": "phone_await_number"}
         send(chat_id, "📱 بطاقة رقم هاتف: أرسل الرقم بالصيغة الدولية "
