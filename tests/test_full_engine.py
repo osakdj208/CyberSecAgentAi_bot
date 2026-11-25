@@ -220,6 +220,16 @@ class FullScanOrchestrationTests(unittest.TestCase):
              mock.patch.object(main, "nmap_data",
                                return_value={"ports": [], "summary": {}}), \
              mock.patch.object(main, "email_security", return_value=email), \
+             mock.patch.object(main, "dns_deep_audit",
+                               return_value={"status": "ready",
+                                             "axfr": {"vulnerable": False,
+                                                      "attempts": []},
+                                             "dnssec": {"signed": True},
+                                             "caa": {"present": True,
+                                                     "records": []}}), \
+             mock.patch.object(main, "subdomain_takeover_check",
+                               return_value={"status": "ready", "checked": 0,
+                                             "findings": []}), \
              mock.patch.object(main, "dns_records",
                                return_value={"status": "ready", "records": {}}):
             out = main.full_scan(req, authorization="Bearer test-engine-token",
