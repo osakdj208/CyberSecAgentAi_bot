@@ -70,10 +70,13 @@ CATALOG_NOTE = (
     "الفرعية، فحص منافذ لأهم الخوادم، تقييم ويب (Nuclei + TLS + ترويسات) "
     "لأهم المواقع الحية، بصمات تقنية، تدقيق أمان بريد (SPF/DKIM/DMARC)، "
     "ودرجة أمان موحدة 0-100 بخصومات معلنة الأسباب وأولويات إصلاح. "
-    "(8) فحص موحّد (المرحلة أ): طلب واحد يجمع نطاقاً + رابط متجر "
-    "(بطاقة التطبيق العامة من صفحته) + ملف APK أو رابطه المباشر، "
-    "باعتماد واحد وتقرير مدمج واحد؛ تحليل ملف التطبيق الثابت نفسه "
-    "ينضم في المرحلة ب. "
+    "(8) فحص موحّد: طلب واحد يجمع نطاقاً + رابط متجر (بطاقة التطبيق "
+    "العامة من صفحته) + ملف APK أو رابطه المباشر، باعتماد واحد "
+    "وتقرير مدمج واحد ودرجة موحّدة (منظومة ٦٠٪ + تطبيق ٤٠٪). "
+    "(9) تحليل تطبيق أندرويد ثابت (ضمن الفحص الموحّد): هوية وصلاحيات "
+    "خطيرة ومكوّنات مكشوفة وأعلام خطرة (تصحيح/HTTP واضح/نسخ احتياطي) "
+    "وأنماط أسرار مدمجة وروابط ومكتبات وشهادة توقيع — بلا تثبيت أو "
+    "تشغيل، وبتصريح مرتبط ببصمة SHA-256 للملف نفسه. "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -454,13 +457,68 @@ def fetch_store_card(info):
         return {"status": "unavailable"}
 
 
+def create_apk_permit(sha256: str, request_id: str, expires_ms: int) -> str:
+    """File-bound permit: the engine re-hashes the uploaded bytes and
+    requires an exact SHA-256 match, so an approval can never be
+    replayed against a different file."""
+    if not PERMIT_SECRET:
+        raise RuntimeError("SCAN_APPROVAL_SECRET is not configured")
+    payload = _b64url(json.dumps(
+        {"sha256": sha256, "kind": "apk",
+         "id": request_id, "exp": expires_ms},
+        separators=(",", ":")).encode())
+    signature = _b64url(hmac.new(
+        PERMIT_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    return payload + "." + signature
+
+
+def download_apk_bytes(apk):
+    """Fetch the app file the requester supplied: from Telegram (their
+    upload, Bot API cap ~20MB) or from their direct link (cap 60MB).
+    Bytes live in memory only for the analysis hand-off."""
+    if apk.get("type") == "file":
+        info = tg("getFile", file_id=apk["file_id"])
+        path = (info.get("result") or {}).get("file_path")
+        if not path:
+            raise RuntimeError("تعذّر جلب مسار الملف من تيليجرام.")
+        url = f"https://api.telegram.org/file/bot{TOKEN}/{path}"
+        cap = 21 * 1024 * 1024
+    else:
+        url = apk["url"]
+        cap = 60 * 1024 * 1024
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "CyberSecurityAI-Agent/0.9"})
+    with urllib.request.urlopen(request, timeout=120) as resp:
+        data = resp.read(cap + 1)
+    if len(data) > cap:
+        raise RuntimeError("حجم ملف التطبيق يتجاوز الحد المسموح للتحليل.")
+    if len(data) < 1024:
+        raise RuntimeError("الملف المحمّل صغير جداً ولا يبدو ملف تطبيق.")
+    return data
+
+
+def engine_apk_call(data: bytes, permit: str):
+    if not ENGINE_URL or not ENGINE_TOKEN:
+        raise RuntimeError("المحرك غير مربوط بعد: ENGINE_URL / ENGINE_API_TOKEN غير مضبوطة.")
+    request = urllib.request.Request(
+        ENGINE_URL + "/scans/apk", data=data, method="POST",
+        headers={"Authorization": f"Bearer {ENGINE_TOKEN}",
+                 "X-Scan-Approval": permit,
+                 "Content-Type": "application/octet-stream"})
+    try:
+        with urllib.request.urlopen(request, timeout=600) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"محرك التطبيقات رفض الملف ({exc.code}): {detail}") from exc
+
+
 def run_approved_unified_scan(req):
-    """Phase A unified run: the full attack-surface assessment of the
-    domain (existing engine), plus the public store card, plus the
-    received app-file reference (its static analysis joins in
-    Phase B)."""
+    """Unified run: the full attack-surface assessment of the domain,
+    the public store card, and — since Phase B — the static analysis
+    of the supplied app file itself."""
     bundle = {"full": run_approved_full_scan(req), "store": None,
-              "apk": None}
+              "apk": None, "apk_analysis": None}
     if req.get("store_link"):
         info = parse_store_link(req["store_link"])
         bundle["store"] = (fetch_store_card(info) if info
@@ -470,6 +528,16 @@ def run_approved_unified_scan(req):
             bundle["apk"] = json.loads(req["apk_ref"])
         except Exception:
             bundle["apk"] = None
+    if bundle["apk"]:
+        try:
+            data = download_apk_bytes(bundle["apk"])
+            sha = hashlib.sha256(data).hexdigest()
+            permit = create_apk_permit(
+                sha, req["id"], int(time.time() * 1000) + PERMIT_TTL_MS)
+            bundle["apk_analysis"] = engine_apk_call(data, permit)
+        except Exception as exc:
+            bundle["apk_analysis"] = {"status": "failed",
+                                      "error": str(exc)[:300]}
     return bundle
 
 
@@ -697,22 +765,86 @@ def format_unified_report(req, bundle) -> str:
         lines.append("\n📱 بطاقة التطبيق: تعذّر جلب صفحة المتجر وقت الفحص "
                      "(يُعاد جلبها في أي فحص لاحق).")
     apk = bundle.get("apk")
-    if apk:
-        if apk.get("type") == "file":
+    ana = bundle.get("apk_analysis")
+    full_score = ((bundle.get("full") or {}).get("score") or {}).get("score")
+    if ana and ana.get("status") == "completed" and full_score is not None:
+        merged = round(0.6 * full_score + 0.4 * ana["score"]["score"])
+        lines.append(f"\n🧮 الدرجة الموحّدة: {merged}/100 "
+                     "(منظومة ٦٠٪ + تطبيق ٤٠٪)")
+    if ana and ana.get("status") == "completed":
+        app = ana.get("app") or {}
+        lines.append("\n📱 تحليل التطبيق (ثابت — بلا تثبيت أو تشغيل):")
+        lines.append(f"  التطبيق: {app.get('app_name')} | الحزمة: "
+                     f"{app.get('package')} | الإصدار: "
+                     f"{app.get('version_name')}")
+        lines.append(f"  SDK: الهدف {app.get('target_sdk')} / الأدنى "
+                     f"{app.get('min_sdk')} | بصمة الملف: "
+                     f"{(ana.get('sha256') or '')[:16]}…")
+        perms = ana.get("permissions") or {}
+        lines.append(f"  الصلاحيات: {perms.get('total')} "
+                     f"(خطيرة: {len(perms.get('dangerous') or [])})")
+        for p in (perms.get("dangerous") or [])[:6]:
+            lines.append(f"    ⚠️ {p.split('.')[-1]}")
+        comp = ana.get("components") or {}
+        lines.append(f"  المكوّنات: {comp.get('activities')} نشاطاً، "
+                     f"{comp.get('services')} خدمة، "
+                     f"{comp.get('receivers')} مستقبِلاً، "
+                     f"{comp.get('providers')} مزوّداً")
+        for name in (comp.get("exported_open") or [])[:6]:
+            lines.append(f"    🔓 مكشوف بلا حماية: {name}")
+        flags = ana.get("flags") or {}
+        if flags.get("debuggable"):
+            lines.append("  🚨 التطبيق قابل للتصحيح (debuggable)!")
+        if flags.get("cleartext_traffic"):
+            lines.append("  ⚠️ حركة HTTP الواضحة مسموحة في التطبيق")
+        if flags.get("allow_backup"):
+            lines.append("  ⚠️ النسخ الاحتياطي مسموح (بيانات قابلة للاستخراج)")
+        secrets = ana.get("secrets") or []
+        if secrets:
+            lines.append("  🔑 أنماط أسرار مدمجة محتملة (مرشحات للتحقق، "
+                         "تُعرض مختصرة فقط):")
+            for s in secrets[:6]:
+                lines.append(f"    • {s.get('type')} في {s.get('where')} "
+                             f"({s.get('preview')})")
+        urls = ana.get("urls") or {}
+        if urls.get("total"):
+            lines.append(f"  الروابط داخل الكود: {urls['total']} "
+                         f"(واضحة HTTP: {len(urls.get('cleartext') or [])})")
+            for d, c in (urls.get("top_domains") or [])[:4]:
+                lines.append(f"    • {d} (×{c})")
+        if ana.get("sdks"):
+            lines.append("  مكتبات/خدمات مكتشفة: "
+                         + "، ".join(ana["sdks"][:8]))
+        cert = ana.get("certificate") or {}
+        if cert:
+            lines.append(f"  شهادة التوقيع: {cert.get('subject', '')[:70]} "
+                         f"| تنتهي {cert.get('not_after')}"
+                         + (" | توقيع ذاتي" if cert.get("self_signed") else ""))
+        lines.append(f"  🏆 درجة التطبيق: {ana['score']['score']}/100 "
+                     f"({ana['score']['grade']})")
+        for d in (ana["score"].get("deductions") or [])[:5]:
+            lines.append(f"    −{d.get('points')}: {d.get('label')}")
+    elif apk:
+        if ana and ana.get("status") == "failed":
+            lines.append(f"\n📦 ملف التطبيق: تعذّر تحليله — "
+                         f"{ana.get('error')}")
+        elif apk.get("type") == "file":
             size = apk.get("size")
             size_txt = (f"{size / 1_000_000:.1f}MB" if size
                         else "حجم غير معروف")
             lines.append(f"\n📦 ملف التطبيق مستلم مع الطلب: "
-                         f"{apk.get('name')} ({size_txt}). مرجعه محفوظ، "
-                         "ومحرك تحليله الثابت ينضم في المرحلة ب.")
+                         f"{apk.get('name')} ({size_txt}).")
         else:
             lines.append(f"\n📦 رابط ملف التطبيق مستلم مع الطلب: "
-                         f"{apk.get('url')}. محرك تحليله الثابت ينضم "
-                         "في المرحلة ب.")
+                         f"{apk.get('url')}.")
     lines.append("\n" + format_full_report(req, bundle["full"]))
-    lines.append("\nملاحظة المرحلة أ: الدرجة أعلاه هي درجة تقييم المنظومة؛ "
-                 "تنضم إليها درجة التطبيق في درجة موحّدة واحدة عند تفعيل "
-                 "محرك تحليل التطبيقات (المرحلة ب).")
+    if ana and ana.get("status") == "completed":
+        lines.append("\nالدرجة الموحّدة: ٦٠٪ درجة المنظومة + ٤٠٪ درجة "
+                     "التطبيق. تحليل التطبيق ثابت فقط (لا تثبيت ولا "
+                     "تشغيل)، وأنماط الأسرار مرشحات يعاينها المالك.")
+    else:
+        lines.append("\nملاحظة: هذا التقرير بلا تحليل تطبيق مكتمل — "
+                     "الدرجة أعلاه درجة المنظومة فقط.")
     return "\n".join(lines)
 
 
@@ -1395,8 +1527,9 @@ def handle_message(msg):
         state.update(step="u_await_apk", store_link=store_link)
         send(chat_id, "خطوة اختيارية: أرسل ملف التطبيق APK نفسه كمستند "
                       "(حتى 20MB)، أو رابطاً مباشراً ينتهي بـ ‎.apk، "
-                      "أو «تخطي». يُحفظ مرجع الملف مع الطلب لتحليله عند "
-                      "تفعيل محرك التطبيقات (المرحلة ب).")
+                      "أو «تخطي». سيُحلَّل الملف تحليلاً ثابتاً (صلاحيات "
+                      "ومكوّنات مكشوفة وأسرار مدمجة وشهادة توقيع) ضمن "
+                      "الفحص الموحّد بعد الاعتماد.")
         return
     if state and state["step"] == "u_await_apk":
         apk = None
