@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.10.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.11.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"},{"name":"API surface & GraphQL introspection check","state":"ready"},{"name":"JavaScript mining (exposed secrets, API endpoints, internal addresses)","state":"ready"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -1073,6 +1073,137 @@ def dns_deep_audit(domain):
                        "dnskey_present": bool(dnskey)},
             "caa": {"present": bool(caa), "records": caa[:5]}}
 
+# --------------------- Phase C2: API surface / GraphQL + JavaScript mining
+def _http_get(url, timeout=5, cap=262144):
+    """(status, text) for one bounded GET; (None, "") on transport
+    failure. HTTP error statuses still return their body — detectors
+    need it."""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(cap).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read(cap).decode("utf-8", "ignore")
+        except Exception:
+            return exc.code, ""
+    except Exception:
+        return None, ""
+
+def _http_post_json(url, payload, timeout=5, cap=65536):
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(), method="POST",
+            headers={"User-Agent": "CyberSecurityAI-Agent/1.0",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(cap).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read(cap).decode("utf-8", "ignore")
+        except Exception:
+            return exc.code, ""
+    except Exception:
+        return None, ""
+
+OPENAPI_PATHS = ["/openapi.json", "/swagger.json", "/v3/api-docs",
+                 "/swagger/v1/swagger.json", "/api-docs"]
+API_DOC_PAGES = ["/swagger-ui.html", "/swagger-ui/", "/redoc"]
+GRAPHQL_PATHS = ["/graphql", "/api/graphql"]
+_INTROSPECTION_QUERY = {"query": "{__schema{queryType{name}}}"}
+
+def api_surface_check(host, scheme):
+    """Public API documentation exposure + GraphQL introspection state.
+    Detection only: reads public schema documents and asks a GraphQL
+    endpoint the minimal schema question; never calls business
+    endpoints and never pulls API data."""
+    base = f"{scheme}://{host}"
+    out = {"status": "ready", "openapi": [], "doc_pages": [], "graphql": []}
+    for path in OPENAPI_PATHS:
+        status, text = _http_get(base + path, cap=1048576)
+        if status != 200 or not text:
+            continue
+        try:
+            doc = json.loads(text)
+        except Exception:
+            continue
+        if isinstance(doc, dict) and ("openapi" in doc or "swagger" in doc):
+            info = doc.get("info") or {}
+            out["openapi"].append({
+                "path": path,
+                "title": str(info.get("title", ""))[:80],
+                "version": str(info.get("version", ""))[:20],
+                "endpoints": len(doc.get("paths") or {})})
+    for path in API_DOC_PAGES:
+        status, text = _http_get(base + path, cap=65536)
+        lowered = (text or "").lower()
+        if status == 200 and ("swagger" in lowered or "redoc" in lowered):
+            out["doc_pages"].append(path)
+    for path in GRAPHQL_PATHS:
+        status, text = _http_post_json(base + path, _INTROSPECTION_QUERY)
+        if status is None or not text:
+            continue
+        try:
+            doc = json.loads(text)
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        data = doc.get("data") or {}
+        if isinstance(data, dict) and "__schema" in data:
+            out["graphql"].append({"path": path, "introspection": True})
+        elif "errors" in doc:
+            out["graphql"].append({"path": path, "introspection": False})
+    return out
+
+_SCRIPT_SRC_RE = re.compile(
+    r"<script[^>]+src\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_API_PATH_RE = re.compile(
+    r"[\"'](/(?:api|rest|v\d)/[A-Za-z0-9_\-./{}:$]{1,80})[\"']")
+_PRIVATE_IP_RE = re.compile(
+    r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")
+
+def js_mining(host, scheme):
+    """Mine the site's own public JavaScript for exposed secret
+    patterns, API endpoint paths and internal addresses. Same-host
+    scripts only, bounded in count and size; secrets are reported by
+    6-character prefix only (the shared APK secret scanner)."""
+    base = f"{scheme}://{host}"
+    status, html = _http_get(base + "/", cap=524288)
+    if status is None or not html:
+        return {"status": "unavailable"}
+    srcs = []
+    for raw in _SCRIPT_SRC_RE.findall(html):
+        url = urllib.parse.urljoin(base + "/", raw)
+        if urllib.parse.urlparse(url).netloc.lower() == host.lower() \
+                and url not in srcs:
+            srcs.append(url)
+    out = {"status": "ready", "files_checked": 0, "secrets": [],
+           "api_endpoints": [], "internal_addresses": [],
+           "external_domains": []}
+    endpoints, internal, domains = set(), set(), set()
+    for url in srcs[:8]:
+        s2, text = _http_get(url, cap=1572864)
+        if s2 is None or not text:
+            continue
+        out["files_checked"] += 1
+        name = urllib.parse.urlparse(url).path.rsplit("/", 1)[-1] or url
+        out["secrets"] += _scan_text_for_secrets(text, name)
+        endpoints.update(_API_PATH_RE.findall(text))
+        internal.update(_PRIVATE_IP_RE.findall(text))
+        for link in _URL_RE.findall(text):
+            domain = urllib.parse.urlparse(link).netloc.lower()
+            if domain and domain != host.lower():
+                domains.add(domain)
+    out["secrets"] = out["secrets"][:10]
+    out["api_endpoints"] = sorted(endpoints)[:15]
+    out["internal_addresses"] = sorted(internal)[:10]
+    out["external_domains"] = sorted(domains)[:15]
+    return out
+
 COOKIE_FRAMEWORK_HINTS = (
     ("phpsessid", "PHP"), ("jsessionid", "Java"),
     ("asp.net_sessionid", "ASP.NET"), ("aspsessionid", "ASP.NET"),
@@ -1121,7 +1252,8 @@ def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None):
         deductions.append({"points": take, "label": label})
 
     caps = {"_caps": {"nuclei": 40, "tls": 16, "headers": 12,
-                      "ports": 24, "email": 22, "takeover": 20, "dns": 12}}
+                      "ports": 24, "email": 22, "takeover": 20, "dns": 12,
+                      "surface": 16}}
     nonlocal_score = [score]
     sev_points = {"critical": (15, "نتيجة Nuclei حرجة"), "high": (8, "نتيجة Nuclei عالية"),
                   "medium": (3, "نتيجة Nuclei متوسطة"), "low": (1, "نتيجة Nuclei منخفضة")}
@@ -1198,6 +1330,28 @@ def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None):
         if not (dns_audit.get("caa") or {}).get("present"):
             deduct(2, "لا سجلات CAA — أي هيئة شهادات تستطيع إصدار شهادات "
                       "لهذا النطاق", "dns", caps)
+    for host in hosts:
+        api = host.get("api") or {}
+        if api.get("status") == "ready":
+            for g in api.get("graphql") or []:
+                if g.get("introspection"):
+                    deduct(5, f"استبطان GraphQL مفعّل على "
+                              f"{host['host']}{g.get('path')} — مخطط الواجهة "
+                              "مكشوف لأي شخص", "surface", caps)
+            for doc in api.get("openapi") or []:
+                deduct(2, f"وثائق API مكشوفة علناً على "
+                          f"{host['host']}{doc.get('path')}", "surface", caps)
+        js = host.get("js") or {}
+        if js.get("status") == "ready":
+            for s in js.get("secrets") or []:
+                deduct(8, f"سرّ محتمل داخل JavaScript على {host['host']}: "
+                          f"{s.get('type')} ({s.get('preview')})",
+                       "surface", caps)
+            if js.get("internal_addresses"):
+                deduct(3, f"عناوين داخلية داخل JavaScript على "
+                          f"{host['host']}: "
+                          f"{', '.join(js['internal_addresses'][:3])}",
+                       "surface", caps)
     final = max(0, nonlocal_score[0])
     grade = ("ممتاز" if final >= 90 else "جيد" if final >= 75 else
              "متوسط" if final >= 55 else "ضعيف" if final >= 35 else "حرج")
@@ -1229,15 +1383,26 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
         tls = tls_probe(name) if http.get("status") == "ready" else {"status": "skipped"}
         assessed.append({"host": name, "ips": resolved, "http": http,
                          "tls": tls, "tech": tech_fingerprint(http),
-                         "nuclei": {"status": "skipped"}})
+                         "nuclei": {"status": "skipped"},
+                         "api": {"status": "skipped"},
+                         "js": {"status": "skipped"}})
     live = [h for h in assessed if (h.get("http") or {}).get("status") == "ready"]
     nuclei_done = 0
     for entry in live:
         if nuclei_done >= 3 or time.time() - started > 1000:
             entry["nuclei"] = {"status": "skipped_budget"}
+            entry["api"] = {"status": "skipped_budget"}
+            entry["js"] = {"status": "skipped_budget"}
             continue
         entry["nuclei"] = nuclei_scan(entry["host"], deep=False)
         nuclei_done += 1
+        if time.time() - started <= 1150:
+            scheme = (entry.get("http") or {}).get("scheme") or "https"
+            entry["api"] = api_surface_check(entry["host"], scheme)
+            entry["js"] = js_mining(entry["host"], scheme)
+        else:
+            entry["api"] = {"status": "skipped_budget"}
+            entry["js"] = {"status": "skipped_budget"}
     ports_by_ip = []
     for ip in all_ips[:4]:
         if time.time() - started > 1250:
@@ -1269,7 +1434,8 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
                             "Discovery is passive (certificate transparency + resolving wordlist); subdomains that exist but are neither in CT logs nor in the wordlist will not appear.",
                             "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, within one time budget; anything beyond is reported as skipped, never silently dropped.",
                             "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification.",
-                            "Deep DNS audit attempts a zone transfer only against the domain's own nameservers; takeover verdicts are labelled confirmed (the service's unclaimed page answered) or likely (the alias target no longer resolves)."]}
+                            "Deep DNS audit attempts a zone transfer only against the domain's own nameservers; takeover verdicts are labelled confirmed (the service's unclaimed page answered) or likely (the alias target no longer resolves).",
+                            "API/GraphQL checks read public schema documents and ask a GraphQL endpoint only its minimal schema question; JavaScript mining covers same-host scripts only (up to 8 files per host), and secrets are shown by short prefix only."]}
 
 # ------------------------------------------------- Android APK static analysis
 import io, zipfile
