@@ -46,9 +46,11 @@ BOT_MODE = os.environ.get("BOT_MODE", "poll").strip().lower()
 WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
 
 CATALOG_NOTE = (
-    "الكتالوج في المشروع يضم عشرات الأدوات (ZAP, Nuclei, Trivy, YARA وغيرها) "
-    "لكن حالتها كلها «مخطط لها». الموصّل الوحيد الجاهز فعلياً هو Nmap + "
-    "استخبارات IP السلبية، وهذا البوت يعرض ذلك بصدق ولا يدّعي تشغيل البقية."
+    "الموصّلات الجاهزة فعلياً: (1) فحص IP: Nmap محدود + استخبارات IP سلبية. "
+    "(2) فحص موقع شامل: كشف ثغرات Nuclei بقوالب مقيدة + فحص TLS عميق + "
+    "ترويسات أمان HTTP + سجلات DNS. بقية أدوات الكتالوج في المشروع الأصلي "
+    "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
+    "هذا البوت يعرض الجاهز فقط بصدق."
 )
 
 # ---------------------------------------------------------------- storage
@@ -63,6 +65,10 @@ def db():
                result TEXT, error TEXT,
                proof_file_id TEXT, proof_text TEXT)"""
     )
+    try:
+        conn.execute("ALTER TABLE scan_requests ADD COLUMN kind TEXT DEFAULT 'ip'")
+    except sqlite3.OperationalError:
+        pass  # column already exists (v2 databases)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS tg_updates(
                update_id INTEGER PRIMARY KEY, payload TEXT,
@@ -107,11 +113,15 @@ def webhook_secret() -> str:
 def save_request(req):
     with db() as c:
         c.execute(
-            "INSERT INTO scan_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO scan_requests (id, user_id, username, ip, auth_ref,"
+            " top_ports, status, created_at, expires_at, result, error,"
+            " proof_file_id, proof_text, kind)"
+            " VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?)",
             (req["id"], req["user_id"], req["username"], req["ip"],
              req["auth_ref"], req["top_ports"], req["status"],
-             req["created_at"], req["expires_at"], None, None,
-             req.get("proof_file_id"), req.get("proof_text")),
+             req["created_at"], req["expires_at"],
+             req.get("proof_file_id"), req.get("proof_text"),
+             req.get("kind", "ip")),
         )
 
 
@@ -169,8 +179,63 @@ def create_scan_permit(ip: str, request_id: str, expires_ms: int) -> str:
     return payload + "." + signature
 
 
+HOST_RE = re.compile(r"^(?=.{4,253}$)([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$")
+
+
+def validate_host(value: str) -> str:
+    """Domain target for the web-assessment flow: a real domain name, never
+    an IP literal (those use the IP flow) and never a URL with a path."""
+    host = (value or "").strip().lower()
+    for prefix in ("https://", "http://"):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    host = host.split("/")[0].split(":")[0].rstrip(".")
+    is_ip = False
+    try:
+        ipaddress.ip_address(host)
+        is_ip = True
+    except ValueError:
+        pass
+    if is_ip:
+        raise ValueError("هذا عنوان IP — استخدم «طلب فحص جديد» لفحص العناوين.")
+    if not HOST_RE.match(host):
+        raise ValueError("أرسل اسم نطاق صحيحاً (مثال: example.com).")
+    return host
+
+
+def resolve_host_ips(host: str):
+    """Resolve at approval time; the web permit binds this exact address set,
+    and the engine re-resolves and requires its set to be a subset of it."""
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except Exception:
+        raise ValueError("النطاق لا يُحلّ إلى أي عنوان (فشل DNS).")
+    ips = sorted({info[4][0] for info in infos})
+    if not ips:
+        raise ValueError("النطاق لا يُحلّ إلى أي عنوان (فشل DNS).")
+    for ip in ips:
+        if not ipaddress.ip_address(ip).is_global:
+            raise ValueError("النطاق يشير إلى عنوان غير عام — مرفوض حمايةً للشبكات الداخلية.")
+    return ips
+
+
+def create_web_permit(host: str, ips, request_id: str, expires_ms: int) -> str:
+    """Host + resolved-address-set bound permit; verified by the engine's
+    valid_web_permit(). Same HMAC scheme as create_scan_permit()."""
+    if not PERMIT_SECRET:
+        raise RuntimeError("SCAN_APPROVAL_SECRET is not configured")
+    payload = _b64url(json.dumps(
+        {"host": host, "ips": list(ips), "kind": "web",
+         "id": request_id, "exp": expires_ms},
+        separators=(",", ":")).encode())
+    signature = _b64url(hmac.new(
+        PERMIT_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    return payload + "." + signature
+
+
 # ---------------------------------------------------------------- engine client
-def engine_call(method, path, body=None, permit=None):
+def engine_call(method, path, body=None, permit=None, timeout=120):
     if not ENGINE_URL or not ENGINE_TOKEN:
         raise RuntimeError("المحرك غير مربوط بعد: ENGINE_URL / ENGINE_API_TOKEN غير مضبوطة.")
     headers = {"Authorization": f"Bearer {ENGINE_TOKEN}", "Content-Type": "application/json"}
@@ -181,7 +246,7 @@ def engine_call(method, path, body=None, permit=None):
         data=json.dumps(body).encode() if body is not None else None,
         headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
@@ -222,6 +287,98 @@ def format_report(req, result) -> str:
         lines.append(f"⚠️ {warning}")
     lines.append("\nالحدود: فحص محدود بأشهر 100 منفذ TCP، بلا استغلال ولا سكربتات اقتحامية.")
     return "\n".join(lines)
+
+
+def run_approved_web_scan(req):
+    ips = resolve_host_ips(req["ip"])
+    permit = create_web_permit(req["ip"], ips, req["id"],
+                               int(time.time() * 1000) + PERMIT_TTL_MS)
+    return engine_call("POST", "/scans/web", body={
+        "target_host": req["ip"],
+        "authorization_reference": req["auth_ref"],
+        "confirm_authorized": True,
+    }, permit=permit, timeout=900)
+
+
+SEV_AR = {"critical": "حرجة", "high": "عالية", "medium": "متوسطة",
+          "low": "منخفضة", "info": "معلومة", "unknown": "غير مصنفة"}
+
+
+def format_web_report(req, result) -> str:
+    host = result.get("target", req["ip"])
+    lines = [f"✅ اكتمل فحص الموقع {host}",
+             f"المرجع: {req['auth_ref']}  |  الملف: {result.get('profile','')}"]
+    ips = result.get("resolved_ips") or []
+    if ips:
+        lines.append("العناوين: " + "، ".join(ips))
+    dnsr = result.get("dns") or {}
+    records = dnsr.get("records") or {}
+    if dnsr.get("status") == "ready":
+        lines.append("\n🌐 سجلات DNS:")
+        for rtype in ("A", "AAAA", "MX", "NS"):
+            vals = records.get(rtype) or []
+            if vals:
+                lines.append(f"• {rtype}: " + "، ".join(vals[:4]))
+    elif dnsr:
+        lines.append("\n🌐 سجلات DNS: غير متاحة في هذه النسخة من المحرك.")
+    http = result.get("http") or {}
+    if http.get("status") == "ready":
+        lines.append(f"\n🔗 HTTP: الحالة {http.get('http_status')} عبر {http.get('scheme')} — {http.get('final_url')}")
+        if http.get("server"):
+            lines.append(f"الخادم: {http['server']}")
+        lines.append(f"ترويسات الأمان ({http.get('score','?')}):")
+        for h in http.get("present") or []:
+            lines.append(f"  ✅ {h}")
+        for h in http.get("missing") or []:
+            lines.append(f"  ❌ {h}")
+        for c in (http.get("cookies") or [])[:5]:
+            flags = c.get("flags") or {}
+            bad = [k for k, v in flags.items() if not v]
+            if bad:
+                lines.append(f"  ⚠️ كوكيز {c.get('name')}: ينقصه {'، '.join(bad)}")
+    tls = result.get("tls") or {}
+    if tls.get("status") == "ready":
+        issuer = (tls.get("issuer") or {}).get("organizationName") \
+            or (tls.get("issuer") or {}).get("commonName") or "?"
+        lines.append(f"\n🔐 TLS: {tls.get('tls_version')} | الشهادة من {issuer} | "
+                     f"تنتهي {tls.get('not_after')} (بعد {tls.get('days_left')} يوم)")
+        legacy = [k for k, v in (tls.get("legacy_protocols") or {}).items() if v]
+        if legacy:
+            lines.append("  ⚠️ بروتوكولات قديمة مدعومة: " + "، ".join(legacy))
+        else:
+            lines.append("  ✅ لا بروتوكولات TLS قديمة (1.0/1.1)")
+    nuc = result.get("nuclei") or {}
+    lines.append("\n🛡️ فحص الثغرات (Nuclei):")
+    if nuc.get("status") == "ready":
+        counts = nuc.get("counts") or {}
+        if counts:
+            lines.append("النتائج: " + "، ".join(
+                f"{SEV_AR.get(k, k)}: {v}" for k, v in counts.items()))
+        else:
+            lines.append("لا نتائج ضمن القوالب المحدودة — لم يُرصد شيء.")
+        for f in (nuc.get("findings") or [])[:25]:
+            lines.append(f"• [{SEV_AR.get(f.get('severity'), f.get('severity'))}] "
+                         f"{f.get('name')} — {f.get('matched_at')}")
+    else:
+        lines.append(f"الحالة: {nuc.get('status')} — {nuc.get('note','')}")
+    lines.append("\nالحدود: كشف فقط بقوالب مقيدة (بلا استغلال ولا وسوم اقتحامية)، "
+                 "ونتائج الماسح تقارير أولية يراجعها الأدمن قبل أي إجراء.")
+    return "\n".join(lines)
+
+
+def send_long(chat_id, text, reply_markup=None):
+    """Send a long report as consecutive messages (Telegram caps ~4096)."""
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > 3800:
+            chunks.append(current)
+            current = line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks):
+        send(chat_id, chunk, reply_markup if i == len(chunks) - 1 else None)
 
 
 # ---------------------------------------------------------------- telegram api
@@ -267,6 +424,7 @@ def kb(rows):
 
 MAIN_KB = kb([
     [("🔎 طلب فحص جديد", "new_scan")],
+    [("🌐 فحص موقع شامل", "web_scan")],
     [("📋 طلباتي", "my_requests"), ("🩺 حالة المحرك", "health")],
     [("🧰 كتالوج الأدوات", "catalog")],
 ])
@@ -294,10 +452,7 @@ def handle_message(msg):
     if text.startswith("/myrequests"):
         return show_my_requests(chat_id, user.get("id"))
     if text.startswith("/catalog"):
-        send(chat_id, "🧰 " + CATALOG_NOTE +
-             "\n\nالموصّل الجاهز: Nmap TCP/service discovery (أشهر 10–100 منفذ) "
-             "+ RDAP + RIPEstat + DNS عكسي + جغرافيا IP + سمعة AbuseIPDB (اختياري).",
-             MAIN_KB)
+        send(chat_id, "🧰 " + CATALOG_NOTE, MAIN_KB)
         return
 
     if state and state["step"] == "await_ip":
@@ -336,6 +491,52 @@ def handle_message(msg):
         send(chat_id, "اختر حجم الفحص:", kb([
             [("10 منافذ", "ports:10"), ("50 منفذاً", "ports:50"), ("100 منفذ", "ports:100")]]))
         return
+    if state and state["step"] == "w_await_host":
+        try:
+            host = validate_host(text)
+        except ValueError as exc:
+            send(chat_id, f"❌ {exc}\nأرسل اسم نطاق صحيحاً، أو /start للإلغاء.")
+            return
+        state.update(step="w_await_ref", ip=host)
+        send(chat_id, f"الموقع: {host}\nالآن أرسل مرجع التصريح — إثبات أنك تملك "
+                      "هذا الموقع أو لديك تصريح مكتوب لفحصه.")
+        return
+    if state and state["step"] == "w_await_ref":
+        if not (4 <= len(text) <= 120):
+            send(chat_id, "❌ مرجع التصريح يجب أن يكون بين 4 و120 حرفاً. أعد الإرسال.")
+            return
+        state.update(step="w_await_proof", auth_ref=text)
+        send(chat_id, "الآن أرسل إثبات التصريح ليتحقق منه الأدمن قبل القرار: "
+                      "مستند أو صورة (لوحة الاستضافة، فاتورة النطاق، تصريح مكتوب)، "
+                      "أو اكتب تفاصيل الإثبات نصاً. إن لم يوجد إثبات جاهز أرسل «تخطي» "
+                      "— وسيبقى القرار النهائي للأدمن.")
+        return
+    if state and state["step"] == "w_await_proof":
+        proof_file_id = None
+        proof_text = None
+        if msg.get("document"):
+            proof_file_id = msg["document"]["file_id"]
+            proof_text = msg.get("caption") or "مستند إثبات مرفق"
+        elif msg.get("photo"):
+            proof_file_id = msg["photo"][-1]["file_id"]
+            proof_text = msg.get("caption") or "صورة إثبات مرفقة"
+        elif text and text not in ("تخطي", "skip"):
+            proof_text = text[:1000]
+        req = {
+            "id": uuid.uuid4().hex, "user_id": user.get("id"),
+            "username": user.get("username") or user.get("first_name", "?"),
+            "ip": state["ip"], "auth_ref": state["auth_ref"],
+            "proof_file_id": proof_file_id, "proof_text": proof_text,
+            "top_ports": 0, "status": "pending", "kind": "web",
+            "created_at": time.time(),
+            "expires_at": time.time() + APPROVAL_TTL_HOURS * 3600,
+        }
+        save_request(req)
+        STATE.pop(chat_id, None)
+        send(chat_id, f"⏳ تم إنشاء طلب فحص الموقع {req['id'][:8]} للهدف {req['ip']}.\n"
+                      "لن يبدأ أي فحص قبل موافقة الأدمن. ستصلك النتيجة هنا.")
+        notify_admin(req)
+        return
     send(chat_id, "اختر من القائمة، أو أرسل /start للبدء.", MAIN_KB)
 
 
@@ -366,11 +567,15 @@ def show_my_requests(chat_id, user_id):
 def notify_admin(req):
     if not ADMIN_ID:
         return
+    is_web = req.get("kind") == "web"
     send(ADMIN_ID,
-         "🔔 طلب فحص جديد بانتظار قرارك\n"
-         f"الهدف: {req['ip']}\nمن: {req['username']} (ID {req['user_id']})\n"
-         f"مرجع التصريح: {req['auth_ref']}\nالمنافذ: {req['top_ports']}\n"
-         f"إثبات التصريح: {req.get('proof_text') or 'غير مرفق — تحقق بنفسك قبل الاعتماد'}\n"
+         ("🔔 طلب فحص موقع شامل بانتظار قرارك\n" if is_web
+          else "🔔 طلب فحص جديد بانتظار قرارك\n")
+         + f"الهدف: {req['ip']}\nمن: {req['username']} (ID {req['user_id']})\n"
+         f"مرجع التصريح: {req['auth_ref']}\n"
+         + ("النوع: ثغرات (Nuclei) + TLS + ترويسات أمان + DNS\n" if is_web
+            else f"المنافذ: {req['top_ports']}\n")
+         + f"إثبات التصريح: {req.get('proof_text') or 'غير مرفق — تحقق بنفسك قبل الاعتماد'}\n"
          f"رقم الطلب: {req['id'][:8]}",
          kb([[("✅ اعتماد وتنفيذ", f"approve:{req['id']}"),
               ("🚫 رفض", f"reject:{req['id']}")]]))
@@ -397,6 +602,11 @@ def handle_callback(cb):
         STATE[chat_id] = {"step": "await_ip"}
         send(chat_id, "أرسل عنوان IP العام المراد فحصه (مثال: 203.0.113.10).\n"
                       "تنبيه: لا ترسل إلا عنواناً تملكه أو لديك تصريح مكتوب لفحصه.")
+    elif data == "web_scan":
+        STATE[chat_id] = {"step": "w_await_host"}
+        send(chat_id, "أرسل اسم نطاق الموقع المراد فحصه فحصاً شاملاً (مثال: example.com).\n"
+                      "يشمل: كشف ثغرات Nuclei + شهادة TLS + ترويسات الأمان + سجلات DNS.\n"
+                      "تنبيه: لا ترسل إلا موقعاً تملكه أو لديك تصريح مكتوب لفحصه.")
     elif data == "health":
         show_health(chat_id)
     elif data == "my_requests":
@@ -446,13 +656,19 @@ def handle_callback(cb):
         if not transition(rid, "pending", "scanning"):
             send(chat_id, "هذا الطلب قيد المعالجة أصلاً.")
             return
+        is_web = req.get("kind") == "web"
         send(chat_id, f"✅ اعتمدت {rid[:8]}، جارٍ الفحص…")
-        send(req["user_id"], f"🔄 بدأ فحص {req['ip']}، قد يستغرق حتى دقيقتين…")
+        send(req["user_id"], f"🔄 بدأ فحص {req['ip']}، "
+             + ("قد يستغرق حتى عشر دقائق…" if is_web else "قد يستغرق حتى دقيقتين…"))
         try:
-            result = run_approved_scan(req)
-            transition(rid, "scanning", "completed", result=json.dumps(result))
-            report = format_report(req, result)
-            send(req["user_id"], report, MAIN_KB)
+            if is_web:
+                result = run_approved_web_scan(req)
+                transition(rid, "scanning", "completed", result=json.dumps(result))
+                send_long(req["user_id"], format_web_report(req, result), MAIN_KB)
+            else:
+                result = run_approved_scan(req)
+                transition(rid, "scanning", "completed", result=json.dumps(result))
+                send(req["user_id"], format_report(req, result), MAIN_KB)
             if req["user_id"] != ADMIN_ID:
                 send(ADMIN_ID, f"✔️ اكتمل فحص {req['ip']} وأُرسل التقرير للمستخدم.")
         except Exception as exc:
