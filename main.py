@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.6.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.7.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -200,6 +200,11 @@ class WebScanRequest(BaseModel):
     # site owner for authenticated detection. Used in-memory for this scan
     # only: never stored, never logged, never echoed in the response.
     auth_cookie: Optional[str] = Field(default=None, max_length=2048)
+    # Optional owner-agreed CDN pass fingerprint: a header the owner
+    # allowlisted in their WAF (e.g. a Cloudflare skip rule). In-memory
+    # only for this scan; never stored, logged, or echoed.
+    pass_header_name: Optional[str] = Field(default=None, max_length=60)
+    pass_header_value: Optional[str] = Field(default=None, max_length=256)
 
 def normalize_host(value: str) -> str:
     host = (value or "").strip().lower()
@@ -292,13 +297,13 @@ class _RedirectRecorder(urllib.request.HTTPRedirectHandler):
         self.chain.append({"status": code, "to": newurl})
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-def http_probe(host: str):
+def http_probe(host: str, extra_headers: dict = None):
     result = {"status": "unavailable"}
     for scheme in ("https", "http"):
         url = f"{scheme}://{host}/"
         recorder = _RedirectRecorder()
         opener = urllib.request.build_opener(recorder)
-        req = urllib.request.Request(url, headers={"User-Agent": "CyberSecurityAI-Agent/0.5"})
+        req = urllib.request.Request(url, headers={"User-Agent": "CyberSecurityAI-Agent/0.5", **(extra_headers or {})})
         try:
             with opener.open(req, timeout=10) as resp:
                 resp.read(65536)
@@ -325,11 +330,11 @@ def _cert_days_left(not_after: str):
     except Exception:
         return None
 
-def tls_probe(host: str):
+def tls_probe(host: str, connect_to: str = None):
     out = {"status": "unavailable"}
     try:
         ctx = ssl.create_default_context()
-        with socket.create_connection((host, 443), timeout=8) as raw:
+        with socket.create_connection((connect_to or host, 443), timeout=8) as raw:
             with ctx.wrap_socket(raw, server_hostname=host) as tls:
                 cert = tls.getpeercert()
                 out = {"status": "ready", "tls_version": tls.version(),
@@ -349,7 +354,7 @@ def tls_probe(host: str):
             c2.maximum_version = ver
             c2.check_hostname = False
             c2.verify_mode = ssl.CERT_NONE
-            with socket.create_connection((host, 443), timeout=6) as raw:
+            with socket.create_connection((connect_to or host, 443), timeout=6) as raw:
                 with c2.wrap_socket(raw, server_hostname=host):
                     legacy[name] = True
         except Exception:
@@ -379,23 +384,25 @@ def parse_nuclei_jsonl(text: str):
     findings.sort(key=lambda f: order.get(f["severity"], 5))
     return findings[:100], counts
 
-def _nuclei_base_args(cookie=None):
+def _nuclei_base_args(cookie=None, headers=None):
     args = ["-jsonl", "-silent", "-nc", "-ni", "-duc",
             "-severity", "low,medium,high,critical",
             "-etags", "dos,intrusive,fuzz,brute-force",
             "-rl", "25", "-c", "5", "-timeout", "6", "-retries", "1",
             "-max-host-error", "3"]
+    for h in (headers or []):
+        args += ["-H", h]
     if cookie:
         args += ["-H", "Cookie: " + cookie]
     return args
 
-def _run_nuclei(targets, template_dirs, cookie, cap):
+def _run_nuclei(targets, template_dirs, cookie, cap, headers=None):
     if not NUCLEI_PATH:
         return None
     command = [NUCLEI_PATH]
     for t in targets:
         command += ["-u", t]
-    command += _nuclei_base_args(cookie)
+    command += _nuclei_base_args(cookie, headers)
     for d in template_dirs:
         command += ["-t", d]
     try:
@@ -416,17 +423,17 @@ def _template_dirs(relative):
             if os.path.isdir(os.path.join(NUCLEI_TEMPLATES, r))]
 
 def nuclei_scan(host: str, deep: bool = False, cookie: str = None,
-                extra_targets=None):
+                extra_targets=None, headers=None, targets_override=None):
     """Curated detection scan; in deep mode the full CVE tree also runs,
     one year per bounded batch, so peak memory stays free-tier safe."""
     if not NUCLEI_PATH:
         return {"status": "unavailable",
                 "note": "Nuclei binary is not installed in this engine image."}
-    base_targets = [f"https://{host}", f"http://{host}"]
+    base_targets = targets_override or [f"https://{host}", f"http://{host}"]
     targets = base_targets + [t for t in (extra_targets or [])
                               if t not in base_targets][:30]
     curated = _template_dirs(CURATED_DIRS)
-    merged = _run_nuclei(targets, curated or [NUCLEI_TEMPLATES], cookie, 480)
+    merged = _run_nuclei(targets, curated or [NUCLEI_TEMPLATES], cookie, 480, headers=headers)
     if merged is None:
         return {"status": "unavailable",
                 "note": "Nuclei binary is not installed in this engine image."}
@@ -448,7 +455,8 @@ def nuclei_scan(host: str, deep: bool = False, cookie: str = None,
                 continue
             t0 = time.time()
             part = _run_nuclei(base_targets,
-                               [os.path.join(cve_root, year)], cookie, 200)
+                               [os.path.join(cve_root, year)], cookie, 200,
+                               headers=headers)
             spent += int(time.time() - t0)
             if part is None:
                 continue
@@ -481,7 +489,7 @@ NOTABLE_WORDS = ("login", "admin", "api", "swagger", "graphql", "upload",
                  "panel", "dashboard", ".git", "backup", "config",
                  "phpmyadmin", "wp-admin", "console", "actuator")
 
-def katana_crawl(host: str, cookie: str = None):
+def katana_crawl(host: str, cookie: str = None, headers=None):
     """Bounded same-host crawl (depth 2) that discovers the pages and
     endpoints the vulnerability scan should also cover."""
     if not KATANA_PATH:
@@ -492,6 +500,8 @@ def katana_crawl(host: str, cookie: str = None):
                "-retries", "1", "-jc", "-kf", "all"]
     if cookie:
         command += ["-H", "Cookie: " + cookie]
+    for h in (headers or []):
+        command += ["-H", h]
     try:
         result = subprocess.run(command, capture_output=True, text=True,
                                 timeout=150, check=False, shell=False)
@@ -599,26 +609,175 @@ def origin_discovery(host: str):
                     "for this site when asked directly."}
 
 
+def _pass_headers(request):
+    """The owner-agreed CDN pass fingerprint for this scan, if supplied."""
+    name = getattr(request, "pass_header_name", None)
+    value = getattr(request, "pass_header_value", None)
+    if not name or not value:
+        return {}
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,60}", name):
+        raise HTTPException(status_code=400, detail="Invalid pass header name.")
+    return {name: value}
+
 @app.post("/scans/web")
 def web_scan(request: WebScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
     require_auth(authorization)
     if not request.confirm_authorized: raise HTTPException(status_code=400, detail="Explicit authorization confirmation is required.")
     host, ips = check_web_target(request.target_host, x_scan_approval)
-    crawl = katana_crawl(host, request.auth_cookie) if request.deep else {"status": "skipped"}
+    pass_headers = _pass_headers(request)
+    probe_headers = dict(pass_headers)
+    if request.auth_cookie:
+        probe_headers["Cookie"] = request.auth_cookie
+    pass_list = [f"{k}: {v}" for k, v in pass_headers.items()]
+    crawl = katana_crawl(host, request.auth_cookie, headers=pass_list) if request.deep else {"status": "skipped"}
     extra = crawl.get("urls") if crawl.get("status") == "ready" else None
     origin = origin_discovery(host) if request.deep else {"status": "skipped"}
     return {"status": "completed", "target": host, "resolved_ips": ips,
             "authorization_reference": request.authorization_reference,
             "profile": "approved-web-assessment-v2" if request.deep else "approved-web-assessment-v1",
             "deep": bool(request.deep), "authenticated": bool(request.auth_cookie),
-            "dns": dns_records(host), "http": http_probe(host),
+            "pass_used": bool(pass_headers),
+            "dns": dns_records(host), "http": http_probe(host, extra_headers=probe_headers),
             "tls": tls_probe(host),
             "nuclei": nuclei_scan(host, deep=request.deep,
                                   cookie=request.auth_cookie,
-                                  extra_targets=extra),
+                                  extra_targets=extra,
+                                  headers=pass_list),
             "crawl": {k: crawl.get(k) for k in ("status", "total", "notable", "note")},
             "origin": origin,
             "limitations": ["Detection only: curated Nuclei templates with dos/intrusive/fuzz/brute-force tags excluded; no exploitation is attempted.",
                             "Deep mode adds the full CVE template tree in per-year batches and a depth-2 crawl; findings remain scanner reports for the admin to review.",
                             "Origin candidates are passive discoveries (certificate transparency + related subdomains), verified by a direct request; a well-hidden origin may not appear.",
                             "An authenticated scan uses only the test-account session the owner supplied for this scan; it is never stored."]}
+
+# ------------------------------------------------- origin-direct assessment
+class OriginScanRequest(BaseModel):
+    target_host: str
+    origin_ip: str
+    authorization_reference: str = Field(min_length=4, max_length=120)
+    confirm_authorized: bool
+    deep: bool = False
+    auth_cookie: Optional[str] = Field(default=None, max_length=2048)
+    pass_header_name: Optional[str] = Field(default=None, max_length=60)
+    pass_header_value: Optional[str] = Field(default=None, max_length=256)
+
+def valid_origin_permit(value: Optional[str], host: str, ip: str) -> bool:
+    if not value or not PERMIT_SECRET:
+        return False
+    try:
+        payload, signature = value.split(".", 1)
+        expected = hmac.new(PERMIT_SECRET.encode(), payload.encode(),
+                            hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        if not hmac.compare_digest(expected, supplied):
+            return False
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return (data.get("kind") == "origin" and data.get("host") == host
+                and data.get("ip") == ip
+                and bool(data.get("id"))
+                and isinstance(data.get("exp"), (int, float))
+                and data["exp"] > time.time() * 1000)
+    except Exception:
+        return False
+
+def check_origin_target(host_value, ip_value, permit):
+    """Origin scans require a permit minted for exactly this host+IP pair."""
+    host = normalize_host(host_value)
+    try:
+        ip = ipaddress.ip_address((ip_value or "").strip())
+    except ValueError:
+        raise HTTPException(status_code=422,
+                            detail="origin_ip must be a literal IP address.")
+    if not ip.is_global:
+        raise HTTPException(status_code=403,
+                            detail="Origin address must be globally routable.")
+    if not valid_origin_permit(permit, host, str(ip)):
+        raise HTTPException(status_code=403,
+                            detail="Target requires an active admin approval "
+                                   "bound to this host and origin address.")
+    return host, str(ip)
+
+def _raw_http_get(ip, port, host, use_tls, hdrs):
+    sock = socket.create_connection((ip, port), timeout=8)
+    if use_tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(sock, server_hostname=host)
+    lines = ["GET / HTTP/1.1", f"Host: {host}",
+             "User-Agent: Mozilla/5.0 (compatible; authorized-assessment/1.0)",
+             "Accept: */*", "Connection: close"]
+    for k, v in (hdrs or {}).items():
+        lines.append(f"{k}: {v}")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+    data = b""
+    while len(data) < 65536:
+        chunk = sock.recv(8192)
+        if not chunk:
+            break
+        data += chunk
+    sock.close()
+    head = data.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1", "replace")
+    head_lines = head.split("\r\n")
+    parts = head_lines[0].split()
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    headers, cookies = {}, []
+    for line in head_lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip().lower(), v.strip()
+            if k == "set-cookie":
+                cookies.append(v)
+            else:
+                headers[k] = v
+    return status, headers, cookies
+
+def http_probe_at(ip: str, host: str, hdrs: dict = None):
+    """Single-hop probe of the site AS SERVED BY THE ORIGIN ITSELF: the
+    request goes to the origin address with the site's Host/SNI identity,
+    and redirects are recorded, not followed (following would leave the
+    origin and measure the CDN again)."""
+    last = None
+    for scheme, port, use_tls in (("https", 443, True), ("http", 80, False)):
+        try:
+            status, headers, cookies = _raw_http_get(ip, port, host, use_tls, hdrs)
+        except Exception as exc:
+            last = {"status": "unavailable",
+                    "note": f"{type(exc).__name__}: origin did not answer on {scheme}."}
+            continue
+        result = {"status": "ready", "scheme": scheme,
+                  "final_url": f"{scheme}://{host}/ (directly from origin {ip})",
+                  "http_status": status,
+                  "redirects": ([{"status": status, "to": headers["location"]}]
+                                if headers.get("location") else [])}
+        result.update(_analyze_headers(headers, cookies))
+        return result
+    return last
+
+@app.post("/scans/origin")
+def origin_scan(request: OriginScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
+    require_auth(authorization)
+    if not request.confirm_authorized: raise HTTPException(status_code=400, detail="Explicit authorization confirmation is required.")
+    host, ip = check_origin_target(request.target_host, request.origin_ip, x_scan_approval)
+    pass_headers = _pass_headers(request)
+    probe_headers = dict(pass_headers)
+    if request.auth_cookie:
+        probe_headers["Cookie"] = request.auth_cookie
+    pass_list = [f"{k}: {v}" for k, v in pass_headers.items()]
+    nuclei = nuclei_scan(host, deep=request.deep, cookie=request.auth_cookie,
+                         headers=pass_list + [f"Host: {host}"],
+                         targets_override=[f"https://{ip}", f"http://{ip}"])
+    return {"status": "completed", "target": host, "origin_ip": ip,
+            "authorization_reference": request.authorization_reference,
+            "profile": "approved-origin-assessment-v2" if request.deep else "approved-origin-assessment-v1",
+            "deep": bool(request.deep), "authenticated": bool(request.auth_cookie),
+            "pass_used": bool(pass_headers),
+            "dns": dns_records(host),
+            "http": http_probe_at(ip, host, probe_headers),
+            "tls": tls_probe(host, connect_to=ip),
+            "nuclei": nuclei,
+            "crawl": {"status": "skipped",
+                      "note": "Crawl is not run in origin mode; the origin server itself is the target."},
+            "limitations": ["The web assessment is served by the origin address directly (Host/SNI identity of the site); public DNS data is shown for reference only.",
+                            "Detection only, identical guardrails to the standard web assessment; no exploitation is attempted.",
+                            "For ports and services on the same server, run the standard IP scan on the origin address."]}
