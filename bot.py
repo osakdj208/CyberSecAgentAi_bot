@@ -767,6 +767,36 @@ def format_full_report(req, result) -> str:
             lines.append("  نتائج Nuclei: تخطّت ميزانية الوقت (مُعلن، غير مُسقط بصمت)")
         elif nuc.get("status") not in ("skipped", None):
             lines.append(f"  نتائج Nuclei: {nuc.get('status')}")
+        api = h.get("api") or {}
+        if api.get("status") == "ready":
+            for doc in api.get("openapi") or []:
+                lines.append(f"  📡 وثائق API مكشوفة: {doc.get('path')} "
+                             f"({doc.get('title') or 'بلا عنوان'} — "
+                             f"{doc.get('endpoints')} نقطة نهاية معلنة)")
+            for page in api.get("doc_pages") or []:
+                lines.append(f"  📡 صفحة وثائق API منشورة: {page}")
+            for g in api.get("graphql") or []:
+                if g.get("introspection"):
+                    lines.append(f"  🧬 GraphQL عند {g.get('path')}: "
+                                 "الاستبطان مفعّل ⚠️ — مخطط الواجهة كاملاً "
+                                 "مكشوف لأي شخص")
+                else:
+                    lines.append(f"  🧬 GraphQL عند {g.get('path')}: "
+                                 "الاستبطان مغلق ✅")
+        js = h.get("js") or {}
+        if js.get("status") == "ready" and js.get("files_checked"):
+            lines.append(f"  🧪 JavaScript: فُحصت {js.get('files_checked')} "
+                         "ملفات من نفس المضيف")
+            for s in (js.get("secrets") or [])[:5]:
+                lines.append(f"    ⚠️ سرّ محتمل ({s.get('type')}) في "
+                             f"{s.get('where')}: {s.get('preview')}")
+            if js.get("internal_addresses"):
+                lines.append("    ⚠️ عناوين داخلية مكشوفة: " +
+                             ", ".join(js["internal_addresses"][:5]))
+            if js.get("api_endpoints"):
+                lines.append(f"    نقاط API مستخرجة: "
+                             f"{len(js['api_endpoints'])} "
+                             f"(مثال: {js['api_endpoints'][0]})")
     ports_by_ip = result.get("ports_by_ip") or []
     if ports_by_ip:
         lines.append("\n🔌 المنافذ (أشهر 100 لكل خادم):")
