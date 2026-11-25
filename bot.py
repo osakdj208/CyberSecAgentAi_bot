@@ -70,6 +70,10 @@ CATALOG_NOTE = (
     "الفرعية، فحص منافذ لأهم الخوادم، تقييم ويب (Nuclei + TLS + ترويسات) "
     "لأهم المواقع الحية، بصمات تقنية، تدقيق أمان بريد (SPF/DKIM/DMARC)، "
     "ودرجة أمان موحدة 0-100 بخصومات معلنة الأسباب وأولويات إصلاح. "
+    "(8) فحص موحّد (المرحلة أ): طلب واحد يجمع نطاقاً + رابط متجر "
+    "(بطاقة التطبيق العامة من صفحته) + ملف APK أو رابطه المباشر، "
+    "باعتماد واحد وتقرير مدمج واحد؛ تحليل ملف التطبيق الثابت نفسه "
+    "ينضم في المرحلة ب. "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -99,6 +103,14 @@ def db():
         conn.execute("ALTER TABLE scan_requests ADD COLUMN origin_ip TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists (v4 databases)
+    try:
+        conn.execute("ALTER TABLE scan_requests ADD COLUMN store_link TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists (v6 databases)
+    try:
+        conn.execute("ALTER TABLE scan_requests ADD COLUMN apk_ref TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists (v6 databases)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS tg_updates(
                update_id INTEGER PRIMARY KEY, payload TEXT,
@@ -145,14 +157,16 @@ def save_request(req):
         c.execute(
             "INSERT INTO scan_requests (id, user_id, username, ip, auth_ref,"
             " top_ports, status, created_at, expires_at, result, error,"
-            " proof_file_id, proof_text, kind, deep, origin_ip)"
-            " VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?)",
+            " proof_file_id, proof_text, kind, deep, origin_ip,"
+            " store_link, apk_ref)"
+            " VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?)",
             (req["id"], req["user_id"], req["username"], req["ip"],
              req["auth_ref"], req["top_ports"], req["status"],
              req["created_at"], req["expires_at"],
              req.get("proof_file_id"), req.get("proof_text"),
              req.get("kind", "ip"), req.get("deep", 0),
-             req.get("origin_ip")),
+             req.get("origin_ip"), req.get("store_link"),
+             req.get("apk_ref")),
         )
 
 
@@ -396,6 +410,69 @@ def run_approved_full_scan(req):
     }, permit=permit, timeout=1800)
 
 
+def parse_store_link(text):
+    """Recognize a public app-store link and extract its identity.
+    Returns {"store", "package"|"app_id", "url"} or None."""
+    t = (text or "").strip()
+    if "play.google.com/store/apps/details" in t:
+        m = re.search(r"[?&]id=([A-Za-z0-9._]+)", t)
+        if m:
+            return {"store": "google_play", "package": m.group(1), "url": t}
+    if "apps.apple.com" in t:
+        m = re.search(r"/id(\d+)", t)
+        if m:
+            return {"store": "app_store", "app_id": m.group(1), "url": t}
+    return None
+
+
+def parse_store_page(page, info):
+    """Public store card from the page's Open Graph tags — the same
+    technique as the t.me public page reader."""
+    title = _meta_content(page, "og:title") or ""
+    for suffix in (" - Apps on Google Play", " App - App Store",
+                   " - App Store", " on the App Store"):
+        if title.endswith(suffix):
+            title = title[: -len(suffix)]
+            break
+    description = _meta_content(page, "og:description") or ""
+    return {"status": "ready", "store": info["store"],
+            "package": info.get("package"), "app_id": info.get("app_id"),
+            "title": title.strip()[:160],
+            "description": description.strip()[:280]}
+
+
+def fetch_store_card(info):
+    try:
+        req = urllib.request.Request(
+            info["url"], headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            # Play pages are ~1.3MB and place their og: tags near the
+            # end; a small read cap silently yields an empty card.
+            page = resp.read(2097152).decode("utf-8", "replace")
+        return parse_store_page(page, info)
+    except Exception:
+        return {"status": "unavailable"}
+
+
+def run_approved_unified_scan(req):
+    """Phase A unified run: the full attack-surface assessment of the
+    domain (existing engine), plus the public store card, plus the
+    received app-file reference (its static analysis joins in
+    Phase B)."""
+    bundle = {"full": run_approved_full_scan(req), "store": None,
+              "apk": None}
+    if req.get("store_link"):
+        info = parse_store_link(req["store_link"])
+        bundle["store"] = (fetch_store_card(info) if info
+                           else {"status": "unavailable"})
+    if req.get("apk_ref"):
+        try:
+            bundle["apk"] = json.loads(req["apk_ref"])
+        except Exception:
+            bundle["apk"] = None
+    return bundle
+
+
 SEV_AR = {"critical": "حرجة", "high": "عالية", "medium": "متوسطة",
           "low": "منخفضة", "info": "معلومة", "unknown": "غير مصنفة"}
 
@@ -602,6 +679,43 @@ def format_full_report(req, result) -> str:
     return "\n".join(lines)
 
 
+def format_unified_report(req, bundle) -> str:
+    lines = ["🧩 التقرير الموحّد — منظومة + تطبيق",
+             f"المرجع: {req['auth_ref']}"]
+    store = bundle.get("store")
+    if store and store.get("status") == "ready":
+        lines.append("\n📱 بطاقة التطبيق من المتجر (بيانات عامة منشورة):")
+        if store.get("title"):
+            lines.append(f"  الاسم: {store['title']}")
+        if store.get("package"):
+            lines.append(f"  الحزمة: {store['package']}")
+        if store.get("app_id"):
+            lines.append(f"  معرف المتجر: {store['app_id']}")
+        if store.get("description"):
+            lines.append(f"  الوصف: {store['description']}")
+    elif req.get("store_link"):
+        lines.append("\n📱 بطاقة التطبيق: تعذّر جلب صفحة المتجر وقت الفحص "
+                     "(يُعاد جلبها في أي فحص لاحق).")
+    apk = bundle.get("apk")
+    if apk:
+        if apk.get("type") == "file":
+            size = apk.get("size")
+            size_txt = (f"{size / 1_000_000:.1f}MB" if size
+                        else "حجم غير معروف")
+            lines.append(f"\n📦 ملف التطبيق مستلم مع الطلب: "
+                         f"{apk.get('name')} ({size_txt}). مرجعه محفوظ، "
+                         "ومحرك تحليله الثابت ينضم في المرحلة ب.")
+        else:
+            lines.append(f"\n📦 رابط ملف التطبيق مستلم مع الطلب: "
+                         f"{apk.get('url')}. محرك تحليله الثابت ينضم "
+                         "في المرحلة ب.")
+    lines.append("\n" + format_full_report(req, bundle["full"]))
+    lines.append("\nملاحظة المرحلة أ: الدرجة أعلاه هي درجة تقييم المنظومة؛ "
+                 "تنضم إليها درجة التطبيق في درجة موحّدة واحدة عند تفعيل "
+                 "محرك تحليل التطبيقات (المرحلة ب).")
+    return "\n".join(lines)
+
+
 def send_long(chat_id, text, reply_markup=None):
     """Send a long report as consecutive messages (Telegram caps ~4096)."""
     chunks, current = [], ""
@@ -663,6 +777,7 @@ MAIN_KB = kb([
     [("🌐 فحص موقع شامل", "web_scan")],
     [("🎯 فحص خادم الأصل", "origin_scan")],
     [("🏢 تقييم شامل لمنظومة", "full_scan")],
+    [("🧩 فحص موحّد (موقع + تطبيق)", "uni_scan")],
     [("🪪 بطاقة حساب تيليجرام", "tg_card")],
     [("📱 بطاقة رقم هاتف", "phone_card")],
     [("📋 طلباتي", "my_requests"), ("🩺 حالة المحرك", "health")],
@@ -1257,6 +1372,75 @@ def handle_message(msg):
         state.update(proof_file_id=proof_file_id, proof_text=proof_text)
         create_full_request(chat_id, user, state)
         return
+    if state and state["step"] == "u_await_host":
+        try:
+            host = validate_host(text)
+        except ValueError as exc:
+            send(chat_id, f"❌ {exc}\nأرسل اسم نطاق صحيحاً، أو /start للإلغاء.")
+            return
+        state.update(step="u_await_store", ip=host)
+        send(chat_id, f"المنظومة: {host}\nخطوة اختيارية: أرسل رابط تطبيقك "
+                      "في Google Play أو App Store لبطاقة التطبيق العامة، "
+                      "أو «تخطي».")
+        return
+    if state and state["step"] == "u_await_store":
+        store_link = None
+        if text and text not in ("تخطي", "skip"):
+            info = parse_store_link(text)
+            if not info:
+                send(chat_id, "❌ هذا ليس رابط متجر معروفاً. أرسل رابط "
+                              "Google Play أو App Store، أو «تخطي».")
+                return
+            store_link = info["url"]
+        state.update(step="u_await_apk", store_link=store_link)
+        send(chat_id, "خطوة اختيارية: أرسل ملف التطبيق APK نفسه كمستند "
+                      "(حتى 20MB)، أو رابطاً مباشراً ينتهي بـ ‎.apk، "
+                      "أو «تخطي». يُحفظ مرجع الملف مع الطلب لتحليله عند "
+                      "تفعيل محرك التطبيقات (المرحلة ب).")
+        return
+    if state and state["step"] == "u_await_apk":
+        apk = None
+        if msg.get("document"):
+            doc = msg["document"]
+            apk = {"type": "file", "file_id": doc["file_id"],
+                   "name": doc.get("file_name") or "app.apk",
+                   "size": doc.get("file_size")}
+        elif text and text not in ("تخطي", "skip"):
+            if re.match(r"^https?://\S+\.apk(\?\S*)?$", text, re.I):
+                apk = {"type": "link", "url": text}
+            else:
+                send(chat_id, "❌ أرسل ملف APK كمستند، أو رابطاً مباشراً "
+                              "ينتهي بـ ‎.apk، أو «تخطي».")
+                return
+        state.update(step="u_await_ref", apk_ref=apk)
+        send(chat_id, "الآن أرسل مرجع التصريح — إثبات أنك تملك هذه "
+                      "المنظومة والتطبيق أو لديك تصريح مكتوب لفحصهما.")
+        return
+    if state and state["step"] == "u_await_ref":
+        if not (4 <= len(text) <= 120):
+            send(chat_id, "❌ مرجع التصريح يجب أن يكون بين 4 و120 حرفاً. أعد الإرسال.")
+            return
+        state.update(step="u_await_proof", auth_ref=text)
+        send(chat_id, "الآن أرسل إثبات التصريح ليتحقق منه الأدمن قبل "
+                      "القرار: مستند أو صورة (لوحة النطاق/الاستضافة أو "
+                      "حساب المطوّر)، أو اكتب تفاصيل الإثبات نصاً. إن لم "
+                      "يوجد إثبات جاهز أرسل «تخطي» — وسيبقى القرار "
+                      "النهائي للأدمن.")
+        return
+    if state and state["step"] == "u_await_proof":
+        proof_file_id = None
+        proof_text = None
+        if msg.get("document"):
+            proof_file_id = msg["document"]["file_id"]
+            proof_text = msg.get("caption") or "مستند إثبات مرفق"
+        elif msg.get("photo"):
+            proof_file_id = msg["photo"][-1]["file_id"]
+            proof_text = msg.get("caption") or "صورة إثبات مرفقة"
+        elif text and text not in ("تخطي", "skip"):
+            proof_text = text[:1000]
+        state.update(proof_file_id=proof_file_id, proof_text=proof_text)
+        create_unified_request(chat_id, user, state)
+        return
     if state and state["step"] == "tg_await_query":
         query = parse_tg_query(text)
         if not query:
@@ -1379,6 +1563,35 @@ def create_full_request(chat_id, user, state):
     notify_admin(req)
 
 
+def create_unified_request(chat_id, user, state):
+    apk = state.get("apk_ref")
+    req = {
+        "id": uuid.uuid4().hex, "user_id": user.get("id"),
+        "username": user.get("username") or user.get("first_name", "?"),
+        "ip": state["ip"], "auth_ref": state["auth_ref"],
+        "proof_file_id": state.get("proof_file_id"),
+        "proof_text": state.get("proof_text"),
+        "top_ports": 0, "status": "pending", "kind": "unified",
+        "deep": 1,
+        "store_link": state.get("store_link"),
+        "apk_ref": json.dumps(apk) if apk else None,
+        "created_at": time.time(),
+        "expires_at": time.time() + APPROVAL_TTL_HOURS * 3600,
+    }
+    save_request(req)
+    STATE.pop(chat_id, None)
+    parts = ["تقييم شامل للنطاق"]
+    if req["store_link"]:
+        parts.append("بطاقة تطبيق من المتجر")
+    if req["apk_ref"]:
+        parts.append("ملف/رابط تطبيق مرفق")
+    send(chat_id, f"⏳ تم إنشاء طلب الفحص الموحّد {req['id'][:8]} للهدف "
+                  f"{req['ip']} ({' + '.join(parts)}).\n"
+                  "لن يبدأ أي فحص قبل موافقة الأدمن، وقد يستغرق بعد "
+                  "الاعتماد حتى ٣٠ دقيقة. ستصلك النتيجة هنا.")
+    notify_admin(req)
+
+
 def show_health(chat_id):
     try:
         health = engine_call("GET", "/health")
@@ -1410,7 +1623,16 @@ def notify_admin(req):
     is_web = kind in ("web", "origin")
     extras = (" + جلسة حساب اختبار" if AUTH_SECRETS.get(req["id"]) else "") + \
              (" + بصمة مرور" if PASS_SECRETS.get(req["id"]) else "")
-    if kind == "full":
+    if kind == "unified":
+        title = "🔔 طلب فحص موحّد بانتظار قرارك\n"
+        parts = ["تقييم شامل للنطاق"]
+        if req.get("store_link"):
+            parts.append("بطاقة متجر")
+        if req.get("apk_ref"):
+            parts.append("ملف/رابط تطبيق مرفق")
+        scope_line = "النوع: فحص موحّد 🧩 (" + " + ".join(parts) + ")"
+        target_line = f"النطاق: {req['ip']}"
+    elif kind == "full":
         title = "🔔 طلب تقييم شامل لمنظومة بانتظار قرارك\n"
         scope_line = ("النوع: تقييم شامل 🏢 (اكتشاف نطاقات فرعية + منافذ + "
                       "ويب لكل مضيف حي + بريد + درجة أمان)")
@@ -1486,6 +1708,14 @@ def handle_callback(cb):
                       "إصلاح.\nأرسل النطاق الرئيسي (مثال: example.com).\n"
                       "تنبيه: لا ترسل إلا نطاقاً تملكه أو لديك تصريح مكتوب "
                       "لتقييمه، والتقييم قد يستغرق حتى ٣٠ دقيقة بعد اعتماد الأدمن.")
+    elif data == "uni_scan":
+        STATE[chat_id] = {"step": "u_await_host"}
+        send(chat_id, "🧩 فحص موحّد: طلب واحد يجمع منظومتك وتطبيقك — "
+                      "تقييم شامل للنطاق + بطاقة تطبيقك من متجره + ملف "
+                      "التطبيق مرفقاً للتحليل، باعتماد واحد وتقرير واحد.\n"
+                      "أرسل أولاً النطاق الرئيسي (مثال: example.com).\n"
+                      "تنبيه: لا ترسل إلا أصولاً تملكها أو لديك تصريح "
+                      "مكتوب لفحصها.")
     elif data == "tg_card":
         STATE[chat_id] = {"step": "tg_await_query"}
         send(chat_id, "🪪 بطاقة حساب تيليجرام: أرسل المعرف (@username) أو "
@@ -1578,12 +1808,19 @@ def handle_callback(cb):
         is_web = kind in ("web", "origin")
         send(chat_id, f"✅ اعتمدت {rid[:8]}، جارٍ الفحص…")
         send(req["user_id"], f"🔄 بدأ فحص {req['ip']}، "
-             + ("التقييم الشامل قد يستغرق حتى ٣٠ دقيقة…" if kind == "full"
+             + ("الفحص الموحّد قد يستغرق حتى ٣٠ دقيقة…" if kind == "unified"
+                else "التقييم الشامل قد يستغرق حتى ٣٠ دقيقة…" if kind == "full"
                 else "العميق قد يستغرق حتى ٢٥ دقيقة…" if is_web and req.get("deep")
                 else "قد يستغرق حتى عشر دقائق…" if is_web
                 else "قد يستغرق حتى دقيقتين…"))
         try:
-            if kind == "full":
+            if kind == "unified":
+                bundle = run_approved_unified_scan(req)
+                transition(rid, "scanning", "completed",
+                           result=json.dumps(bundle["full"]))
+                send_long(req["user_id"], format_unified_report(req, bundle),
+                          MAIN_KB)
+            elif kind == "full":
                 result = run_approved_full_scan(req)
                 transition(rid, "scanning", "completed", result=json.dumps(result))
                 send_long(req["user_id"], format_full_report(req, result), MAIN_KB)
