@@ -61,6 +61,11 @@ CATALOG_NOTE = (
     "البحث العميق (حساب تيليجرام مخصص): الرقم الرقمي لأي معرف عام + علامات "
     "تيليجرام الرسمية (موثّق/احتيالي/مزيّف) + عدد صور الملف ومجموعة النقاش "
     "المرتبطة بالقناة. "
+    "(6) بطاقة رقم هاتف: بيانات الترقيم العالمية لأي رقم بالصيغة الدولية "
+    "(الدولة والمشغّل المسجل لنطاق الرقم ونوع الخط والصلاحية) + الحسابات "
+    "العامة المرتبطة بالرقم: تيليجرام عبر اكتشافه الرسمي (يظهر فقط من سمح "
+    "بالعثور عليه برقمه في إعداداته)؛ واتساب وسيغنال لا يوفران تحققاً "
+    "عاماً موثوقاً من الأرقام فلا تُعرض لهما نتائج مختلقة. "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -517,6 +522,7 @@ MAIN_KB = kb([
     [("🌐 فحص موقع شامل", "web_scan")],
     [("🎯 فحص خادم الأصل", "origin_scan")],
     [("🪪 بطاقة حساب تيليجرام", "tg_card")],
+    [("📱 بطاقة رقم هاتف", "phone_card")],
     [("📋 طلباتي", "my_requests"), ("🩺 حالة المحرك", "health")],
     [("🧰 كتالوج الأدوات", "catalog")],
 ])
@@ -786,6 +792,127 @@ def tg_card_lookup(query, is_admin=False):
     return "\n".join(lines)
 
 
+# ------------------------------------------------- phone card (R1 + R3)
+def _phone_type_labels():
+    import phonenumbers
+    pt = phonenumbers.PhoneNumberType
+    return {
+        pt.MOBILE: "جوال",
+        pt.FIXED_LINE: "ثابت",
+        pt.FIXED_LINE_OR_MOBILE: "ثابت أو جوال",
+        pt.VOIP: "صوت عبر الإنترنت (VoIP)",
+        pt.TOLL_FREE: "رقم مجاني",
+        pt.PREMIUM_RATE: "رقم مميز التكلفة",
+        pt.SHARED_COST: "رقم مشترك التكلفة",
+        pt.PAGER: "بيجر",
+        pt.PERSONAL_NUMBER: "رقم شخصي",
+        pt.UAN: "رقم خدمة موحد",
+        pt.VOICEMAIL: "بريد صوتي",
+        pt.UNKNOWN: "غير محدد",
+    }
+
+
+def parse_phone_number(text):
+    """Parse a phone number in international format against the global
+    numbering plan (libphonenumber data). Pure numbering data — no
+    personal information is looked up here. Returns None when the
+    number cannot be parsed at all, {"valid": False} when it parses
+    but is not a real allocated number."""
+    try:
+        import phonenumbers
+        from phonenumbers import carrier, geocoder
+    except Exception:
+        return None
+    raw = re.sub(r"[\s\-()]+", "", (text or "").strip())
+    if raw.startswith("00"):
+        raw = "+" + raw[2:]
+    if not raw.startswith("+"):
+        return None
+    try:
+        num = phonenumbers.parse(raw, None)
+    except Exception:
+        return None
+    if not phonenumbers.is_valid_number(num):
+        return {"valid": False}
+    e164 = phonenumbers.format_number(
+        num, phonenumbers.PhoneNumberFormat.E164)
+    country = (geocoder.description_for_number(num, "ar")
+               or geocoder.description_for_number(num, "en") or "")
+    oper = (carrier.name_for_number(num, "ar")
+            or carrier.name_for_number(num, "en") or "")
+    return {"valid": True, "e164": e164, "country": country,
+            "carrier": oper,
+            "type": _phone_type_labels().get(
+                phonenumbers.number_type(num), "غير محدد")}
+
+
+def phone_card_lookup(text, is_admin=False):
+    """Build the phone card: R1 numbering data + R3 public accounts
+    discoverable by this number (Telegram's own discovery — only users
+    who allow being found by number; WhatsApp and Signal offer no
+    reliable public number check, and the card says so honestly)."""
+    info = parse_phone_number(text)
+    if info is None:
+        return ("❌ تعذّرت قراءة الرقم — أرسله بالصيغة الدولية الكاملة "
+                "(مثال: +967700000000).")
+    if not info.get("valid"):
+        return ("❌ الرقم غير صالح وفق خطة الترقيم العالمية — تأكد من "
+                "رمز الدولة والرقم ثم أعد المحاولة.")
+    lines = ["📱 بطاقة رقم هاتف (بيانات ترقيم عامة)"]
+    lines.append(f"الرقم بالصيغة الدولية: {info['e164']}")
+    if info.get("country"):
+        lines.append(f"الدولة: {info['country']}")
+    if info.get("carrier"):
+        lines.append(f"المشغّل المسجل لنطاق الرقم: {info['carrier']} "
+                     "(قد يختلف إن نُقل الرقم إلى مشغّل آخر)")
+    lines.append(f"نوع الخط: {info['type']}")
+    lines.append("الحالة: صالح وفق خطة الترقيم العالمية")
+    lines.append("🔗 الحسابات العامة المرتبطة بالرقم:")
+    tg_res = None
+    tg_state = "off"
+    try:
+        import tgdeep
+        if tgdeep.configured():
+            tg_state = "on"
+            tg_res = tgdeep.phone_lookup(info["e164"])
+    except Exception:
+        tg_res = None
+    if tg_res and tg_res.get("found"):
+        who = (f"@{tg_res['username']}" if tg_res.get("username")
+               else (tg_res.get("name") or "حساب"))
+        extra = (f" — المعرف الرقمي: {tg_res['id']}"
+                 if tg_res.get("id") else "")
+        lines.append(f"تيليجرام: يوجد حساب عام — {who}{extra}")
+        if tg_res.get("verified"):
+            lines.append("   ✔️ موثّق رسمياً من تيليجرام")
+        if tg_res.get("scam"):
+            lines.append("   ⚠️ موسوم «احتيالي» رسمياً من تيليجرام")
+        if tg_res.get("fake"):
+            lines.append("   ⚠️ موسوم «مزيّف» رسمياً من تيليجرام")
+    elif tg_res and tg_res.get("error") == "flood":
+        lines.append("تيليجرام: التحقق مقيّد مؤقتاً من تيليجرام — "
+                     "أعد المحاولة بعد دقائق.")
+    elif (tg_state == "on" and tg_res
+          and tg_res.get("error") == "session_not_authorized" and is_admin):
+        lines.append("تيليجرام: جلسة البحث غير صالحة — تحتاج إعادة تفعيل.")
+    elif tg_state == "on":
+        lines.append("تيليجرام: لا حساب قابل للاكتشاف بهذا الرقم — إما "
+                     "غير مسجل، أو صاحبه أغلق «العثور عليّ برقمي» في "
+                     "إعدادات خصوصيته.")
+    elif is_admin:
+        lines.append("تيليجرام: يتطلب البحث العميق المفعّل.")
+    else:
+        lines.append("تيليجرام: التحقق غير متاح حالياً.")
+    lines.append("واتساب: لا يوفر تحققاً عاماً موثوقاً من الأرقام — "
+                 "صفحته العامة متطابقة للأرقام المسجلة وغير المسجلة "
+                 "(تحققنا من ذلك فعلياً)، فلا نتيجة صادقة ممكنة.")
+    lines.append("سيغنال: لا يوفر أي تحقق عام من الأرقام — غير متاح "
+                 "بأي طريقة رسمية.")
+    lines.append("ملاحظة: ظهور أي حساب يقرره صاحبه في إعدادات اكتشافه — "
+                 "ما أخفاه صاحبه لا يظهر هنا أبداً.")
+    return "\n".join(lines)
+
+
 def handle_message(msg):
     chat_id = msg["chat"]["id"]
     user = msg.get("from", {})
@@ -968,6 +1095,16 @@ def handle_message(msg):
             card = f"❌ تعذّر إكمال البحث: {exc}"
         send(chat_id, card, MAIN_KB)
         return
+    if state and state["step"] == "phone_await_number":
+        STATE.pop(chat_id, None)
+        send(chat_id, "🔎 جارٍ التحقق من الرقم…")
+        try:
+            card = phone_card_lookup(
+                text, is_admin=(user.get("id") == ADMIN_ID))
+        except Exception as exc:
+            card = f"❌ تعذّر إكمال التحقق: {exc}"
+        send(chat_id, card, MAIN_KB)
+        return
     send(chat_id, "اختر من القائمة، أو أرسل /start للبدء.", MAIN_KB)
 
 
@@ -1143,6 +1280,13 @@ def handle_callback(cb):
                       "رابط t.me أو المعرف الرقمي لحساب أو قناة أو مجموعة "
                       "عامة.\nأعرض البيانات العامة فقط: الاسم والنوع وعدد "
                       "الأعضاء والوصف العام وتقديراً تقريبياً لتاريخ الإنشاء.")
+    elif data == "phone_card":
+        STATE[chat_id] = {"step": "phone_await_number"}
+        send(chat_id, "📱 بطاقة رقم هاتف: أرسل الرقم بالصيغة الدولية "
+                      "الكاملة (مثال: +967700000000).\nأعرض: الدولة "
+                      "والمشغّل ونوع الخط من بيانات الترقيم العالمية، "
+                      "والحساب العام المرتبط بالرقم في تيليجرام إن سمح "
+                      "صاحبه بالعثور عليه برقمه.")
     elif data == "health":
         show_health(chat_id)
     elif data == "my_requests":
