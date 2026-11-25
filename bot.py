@@ -57,7 +57,10 @@ CATALOG_NOTE = (
     "جدران الحماية بتصريح المالك. "
     "(5) بطاقة حساب تيليجرام: بطاقة معلومات عامة لأي حساب أو قناة أو مجموعة "
     "عامة (الاسم والنوع وعدد الأعضاء والوصف العام + تقدير تقريبي لتاريخ "
-    "الإنشاء من نطاق المعرف الرقمي) — بيانات منشورة علناً فقط. "
+    "الإنشاء من نطاق المعرف الرقمي) — بيانات منشورة علناً فقط. ومع تفعيل "
+    "البحث العميق (حساب تيليجرام مخصص): الرقم الرقمي لأي معرف عام + علامات "
+    "تيليجرام الرسمية (موثّق/احتيالي/مزيّف) + عدد صور الملف ومجموعة النقاش "
+    "المرتبطة بالقناة. "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -631,7 +634,7 @@ def fetch_tme_page(username):
         return ""
 
 
-def tg_card_lookup(query):
+def tg_card_lookup(query, is_admin=False):
     """Build the public Telegram card text for a parsed query."""
     kind, value = query
     username = value if kind == "username" else None
@@ -651,6 +654,24 @@ def tg_card_lookup(query):
         numeric_id = chat.get("id", numeric_id)
         username = chat.get("username") or username
 
+    # Deep tier (MTProto, dedicated account): resolves what the Bot API
+    # cannot — numeric ID for users, official flags, photo count, linked
+    # discussion group. Dormant until TG_API_ID/TG_API_HASH/TG_SESSION
+    # are configured; any failure degrades to the public card.
+    deep = None
+    deep_state = "off"
+    try:
+        import tgdeep
+        if tgdeep.configured():
+            deep_state = "on"
+            deep = tgdeep.deep_lookup(query)
+    except Exception:
+        deep = None
+    deep_ok = bool(deep) and not deep.get("error")
+    if deep_ok:
+        numeric_id = deep.get("marked_id") or deep.get("id") or numeric_id
+        username = deep.get("username") or username
+
     name = None
     if chat:
         name = chat.get("title") or " ".join(
@@ -658,6 +679,8 @@ def tg_card_lookup(query):
             if x) or None
     if not name:
         name = page_info.get("name")
+    if deep_ok and deep.get("name"):
+        name = deep["name"]
 
     kind_label = None
     if chat and chat.get("type") in TG_KIND_LABELS:
@@ -671,6 +694,10 @@ def tg_card_lookup(query):
         kind_label = "مستخدم"
     if not kind_label and numeric_id is not None and numeric_id < 0:
         kind_label = "قناة/مجموعة (من صيغة المعرف)"
+    if deep_ok and deep.get("kind") in (
+            "user", "bot", "channel", "supergroup", "group"):
+        kind_label = TG_KIND_LABELS[
+            {"user": "private"}.get(deep["kind"], deep["kind"])]
 
     members = None
     if chat and chat.get("type") in ("channel", "supergroup", "group"):
@@ -682,15 +709,50 @@ def tg_card_lookup(query):
         except Exception:
             members = None
 
+    if deep_ok and deep.get("participants") is not None:
+        members = deep["participants"]
+
     description = None
     if chat and chat.get("description"):
         description = chat["description"]
     elif page_info.get("description"):
         description = page_info["description"]
+    if deep_ok and deep.get("about"):
+        description = deep["about"]
+
+    deep_lines = []
+    if deep_ok:
+        if deep.get("verified"):
+            deep_lines.append("✔️ موثّق رسمياً من تيليجرام")
+        if deep.get("scam"):
+            deep_lines.append("⚠️ موسوم «احتيالي» رسمياً من تيليجرام")
+        if deep.get("fake"):
+            deep_lines.append("⚠️ موسوم «مزيّف» رسمياً من تيليجرام")
+        if deep.get("photos") is not None and deep.get("kind") in (
+                "user", "bot"):
+            deep_lines.append(f"صور الملف الشخصي العامة: {deep['photos']}")
+        if deep.get("linked_username"):
+            deep_lines.append(
+                f"مجموعة النقاش المرتبطة: @{deep['linked_username']}")
+        elif deep.get("linked_title"):
+            deep_lines.append(
+                f"مجموعة النقاش المرتبطة: {deep['linked_title']}")
+
+    state_note = None
+    if not deep_lines:
+        if deep_state == "on" and deep and deep.get("error") == "flood":
+            state_note = ("🔬 البحث العميق مقيّد مؤقتاً من تيليجرام — "
+                          "أعد المحاولة بعد دقائق.")
+        elif deep_state == "on" and is_admin and deep and deep.get(
+                "error") == "session_not_authorized":
+            state_note = "🔬 جلسة البحث العميق غير صالحة — تحتاج إعادة تفعيل."
+        elif deep_state == "off" and is_admin:
+            state_note = "🔬 البحث العميق غير مفعّل بعد (بانتظار خطوة التفعيل)."
 
     if not name and not chat and not page_info and numeric_id is None:
-        return ("🪪 لم أجد بيانات عامة لهذا المعرف — قد يكون غير موجود "
-                "أو غير عام. البيانات الخاصة لا تُجمع ولا تُعرض أبداً.")
+        msg = ("🪪 لم أجد بيانات عامة لهذا المعرف — قد يكون غير موجود "
+               "أو غير عام. البيانات الخاصة لا تُجمع ولا تُعرض أبداً.")
+        return msg + ("\n" + state_note if state_note else "")
 
     lines = ["🪪 بطاقة حساب تيليجرام (بيانات عامة)"]
     if name:
@@ -703,8 +765,14 @@ def tg_card_lookup(query):
         lines.append(f"النوع: {kind_label}")
     if members is not None:
         lines.append(f"الأعضاء/المشتركون: {members:,}")
-    elif page_info.get("extra"):
+    elif page_info.get("extra") and any(
+            w in page_info["extra"] for w in ("subscribers", "members")):
         lines.append(f"إحصائية عامة: {page_info['extra']}")
+    if deep_lines:
+        lines.append("🔬 من البحث العميق:")
+        lines.extend(deep_lines)
+    elif state_note:
+        lines.append(state_note)
     if numeric_id is not None and numeric_id > 0:
         period = estimate_creation_period(numeric_id)
         if period:
@@ -895,7 +963,7 @@ def handle_message(msg):
         STATE.pop(chat_id, None)
         send(chat_id, "🔎 جارٍ جلب البيانات العامة…")
         try:
-            card = tg_card_lookup(query)
+            card = tg_card_lookup(query, is_admin=(user.get("id") == ADMIN_ID))
         except Exception as exc:
             card = f"❌ تعذّر إكمال البحث: {exc}"
         send(chat_id, card, MAIN_KB)
