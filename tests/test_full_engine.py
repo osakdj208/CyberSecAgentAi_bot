@@ -230,6 +230,17 @@ class FullScanOrchestrationTests(unittest.TestCase):
              mock.patch.object(main, "subdomain_takeover_check",
                                return_value={"status": "ready", "checked": 0,
                                              "findings": []}), \
+             mock.patch.object(main, "api_surface_check",
+                               return_value={"status": "ready", "openapi": [],
+                                             "doc_pages": [],
+                                             "graphql": []}), \
+             mock.patch.object(main, "js_mining",
+                               return_value={"status": "ready",
+                                             "files_checked": 0,
+                                             "secrets": [],
+                                             "api_endpoints": [],
+                                             "internal_addresses": [],
+                                             "external_domains": []}), \
              mock.patch.object(main, "dns_records",
                                return_value={"status": "ready", "records": {}}):
             out = main.full_scan(req, authorization="Bearer test-engine-token",
