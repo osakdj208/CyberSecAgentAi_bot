@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.11.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.12.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"},{"name":"API surface & GraphQL introspection check","state":"ready"},{"name":"JavaScript mining (exposed secrets, API endpoints, internal addresses)","state":"ready"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"},{"name":"API surface & GraphQL introspection check","state":"ready"},{"name":"JavaScript mining (exposed secrets, API endpoints, internal addresses)","state":"ready"},{"name":"Cloud storage exposure check (S3 / Azure Blob / GCS)","state":"ready"},{"name":"Dependency vulnerability analysis (SCA via OSV.dev)","state":"ready"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -1204,6 +1204,381 @@ def js_mining(host, scheme):
     out["external_domains"] = sorted(domains)[:15]
     return out
 
+# --------------------- Phase C3: cloud storage exposure + SCA (OSV.dev)
+_BUCKET_SUFFIXES = ["", "-assets", "-backup", "-backups", "-files",
+                    "-media", "-static", "-data", "-uploads", "-images",
+                    "-docs", "-public"]
+
+def cloud_storage_check(base):
+    """Public cloud-storage exposure for bucket names derived from the
+    domain: Amazon S3, Google Cloud Storage, Azure Blob. A bucket is
+    reported as exposed ONLY when an anonymous listing actually
+    succeeds; buckets that exist but are private are counted as an
+    informational note, never flagged as findings."""
+    label = base.split(".")[0].lower()
+    nodash = label.replace("-", "")
+    names = []
+    for suffix in _BUCKET_SUFFIXES:
+        candidate = label + suffix
+        if candidate not in names:
+            names.append(candidate)
+    out = {"status": "ready", "exposed": [], "private_existing": 0,
+           "candidates_checked": 0}
+    for name in names:
+        out["candidates_checked"] += 1
+        status, text = _http_get(f"https://{name}.s3.amazonaws.com/",
+                                 timeout=4, cap=32768)
+        if status == 200 and "ListBucketResult" in (text or ""):
+            out["exposed"].append({
+                "provider": "Amazon S3", "name": name,
+                "url": f"https://{name}.s3.amazonaws.com/",
+                "evidence": "anonymous listing succeeded"})
+        elif status == 403:
+            out["private_existing"] += 1
+        status, text = _http_get(
+            f"https://storage.googleapis.com/{name}",
+            timeout=4, cap=32768)
+        if status == 200 and "ListBucketResult" in (text or ""):
+            out["exposed"].append({
+                "provider": "Google Cloud Storage", "name": name,
+                "url": f"https://storage.googleapis.com/{name}",
+                "evidence": "anonymous listing succeeded"})
+        elif status == 403:
+            out["private_existing"] += 1
+    account = nodash[:24]
+    if len(account) >= 3:
+        out["candidates_checked"] += 1
+        status, _ = _http_get(
+            f"https://{account}.blob.core.windows.net/?comp=list",
+            timeout=4, cap=8192)
+        if status is not None and status != 404:
+            account_private = False
+            for name in names:
+                status, text = _http_get(
+                    f"https://{account}.blob.core.windows.net/{name}"
+                    "?resttype=container&comp=list",
+                    timeout=4, cap=32768)
+                if status == 200 and "EnumerationResults" in (text or ""):
+                    out["exposed"].append({
+                        "provider": "Azure Blob Storage", "name": name,
+                        "url": f"https://{account}.blob.core.windows.net/"
+                               f"{name}",
+                        "evidence": "anonymous listing succeeded"})
+                elif status == 403:
+                    account_private = True
+            if account_private:
+                out["private_existing"] += 1
+    return out
+
+# --- SCA: dependency-file parsing + OSV.dev matching -------------------
+_DEP_ECOSYSTEMS = {
+    "requirements.txt": "PyPI", "pipfile.lock": "PyPI",
+    "package-lock.json": "npm", "yarn.lock": "npm",
+    "go.mod": "Go", "gemfile.lock": "RubyGems",
+    "composer.lock": "Packagist",
+}
+
+def _parse_requirements(text):
+    deps = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        m = re.match(r"^([A-Za-z0-9_.\-]+)\s*==\s*([^\s;\]]+)", line)
+        if m:
+            deps.append((m.group(1), m.group(2).strip()))
+    return deps
+
+def _parse_package_lock(text):
+    doc = json.loads(text)
+    deps = []
+    packages = doc.get("packages")
+    if isinstance(packages, dict):
+        for path, meta in packages.items():
+            if not path or not isinstance(meta, dict):
+                continue
+            version = meta.get("version")
+            if version:
+                deps.append((path.split("node_modules/")[-1],
+                             str(version)))
+    legacy = doc.get("dependencies")
+    if isinstance(legacy, dict):
+        for name, meta in legacy.items():
+            if isinstance(meta, dict) and meta.get("version"):
+                deps.append((name, str(meta["version"])))
+    return deps
+
+def _parse_yarn_lock(text):
+    deps, current = [], []
+    for line in text.splitlines():
+        if line and not line.startswith((" ", "#")) \
+                and line.rstrip().endswith(":"):
+            current = [h.strip().strip('"') for h in
+                       line.rstrip()[:-1].split(", ")]
+        elif line.strip().startswith('version "') and current:
+            version = line.split('"')[1]
+            for header in current:
+                idx = header.rfind("@")
+                if idx > 0 and version:
+                    deps.append((header[:idx], version))
+            current = []
+    return deps
+
+def _parse_go_mod(text):
+    deps, in_block = [], False
+    for raw in text.splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if line.startswith("require ("):
+            in_block = True
+            continue
+        if in_block and line == ")":
+            in_block = False
+            continue
+        if line.startswith("require "):
+            line = line[len("require "):].strip()
+        elif not in_block:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].startswith("v"):
+            deps.append((parts[0], parts[1].lstrip("v")))
+    return deps
+
+def _parse_gemfile_lock(text):
+    deps, in_specs = [], False
+    for line in text.splitlines():
+        if line.strip() == "specs:":
+            in_specs = True
+            continue
+        if in_specs:
+            if line and not line.startswith(" "):
+                in_specs = False
+                continue
+            m = re.match(r"^    ([A-Za-z0-9_\-]+) \(([^)]+)\)", line)
+            if m:
+                deps.append((m.group(1), m.group(2).split()[0]))
+    return deps
+
+def _parse_pipfile_lock(text):
+    doc = json.loads(text)
+    deps = []
+    for section in ("default", "develop"):
+        for name, meta in (doc.get(section) or {}).items():
+            if isinstance(meta, dict):
+                version = str(meta.get("version") or "").lstrip("=").strip()
+                if version and version != "*":
+                    deps.append((name, version))
+    return deps
+
+def _parse_composer_lock(text):
+    doc = json.loads(text)
+    deps = []
+    for section in ("packages", "packages-dev"):
+        for pkg in doc.get(section) or []:
+            if pkg.get("name") and pkg.get("version"):
+                deps.append((pkg["name"],
+                             str(pkg["version"]).lstrip("v")))
+    return deps
+
+_DEP_PARSERS = {
+    "requirements.txt": _parse_requirements,
+    "pipfile.lock": _parse_pipfile_lock,
+    "package-lock.json": _parse_package_lock,
+    "yarn.lock": _parse_yarn_lock,
+    "go.mod": _parse_go_mod,
+    "gemfile.lock": _parse_gemfile_lock,
+    "composer.lock": _parse_composer_lock,
+}
+
+def parse_dependencies(filename, data):
+    """(canonical_name, [{name, version}]) or (None, None) when the
+    file type is unsupported. Exact pinned versions only — ranges in a
+    bare manifest cannot be matched honestly, so they never reach OSV."""
+    name = (filename or "").lower().rsplit("/", 1)[-1]
+    parser = _DEP_PARSERS.get(name)
+    if not parser:
+        return None, None
+    try:
+        raw = parser(data.decode("utf-8", "replace"))
+    except Exception:
+        return name, []
+    seen, deps = set(), []
+    for pkg, version in raw:
+        key = (pkg.lower(), version)
+        if key not in seen:
+            seen.add(key)
+            deps.append({"name": pkg, "version": version})
+    return name, deps[:200]
+
+OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+OSV_VULN_URL = "https://api.osv.dev/v1/vulns/"
+
+def _osv_lookup(ecosystem, deps):
+    queries = [{"package": {"name": d["name"], "ecosystem": ecosystem},
+                "version": d["version"]} for d in deps]
+    status, text = _http_post_json(OSV_BATCH_URL, {"queries": queries},
+                                   timeout=20, cap=4194304)
+    if status != 200 or not text:
+        return None
+    try:
+        doc = json.loads(text)
+    except Exception:
+        return None
+    out = {}
+    for i, entry in enumerate(doc.get("results") or []):
+        ids = [v.get("id") for v in (entry or {}).get("vulns") or []
+               if v.get("id")]
+        if ids:
+            out[i] = ids
+    return out
+
+def _cvss3_base_score(vector):
+    """CVSS v3.0/3.1 base score per the FIRST specification, or None."""
+    try:
+        metrics = dict(part.split(":", 1) for part in
+                       str(vector).split("/") if ":" in part)
+        av = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}[metrics["AV"]]
+        ac = {"L": 0.77, "H": 0.44}[metrics["AC"]]
+        scope = metrics["S"]
+        pr = ({"N": 0.85, "L": 0.62, "H": 0.27} if scope == "U"
+              else {"N": 0.85, "L": 0.68, "H": 0.5})[metrics["PR"]]
+        ui = {"N": 0.85, "R": 0.62}[metrics["UI"]]
+        vals = {"N": 0.0, "L": 0.22, "H": 0.56}
+        iss = 1 - (1 - vals[metrics["C"]]) * (1 - vals[metrics["I"]]) \
+            * (1 - vals[metrics["A"]])
+        impact = 6.42 * iss if scope == "U" else \
+            7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+        exploit = 8.22 * av * ac * pr * ui
+
+        def roundup(value):
+            scaled = int(value * 100000 + 0.5)
+            if scaled % 10000 == 0:
+                return scaled / 100000.0
+            return (scaled // 10000 + 1) / 10.0
+
+        if impact <= 0:
+            return 0.0
+        if scope == "U":
+            return roundup(min(impact + exploit, 10))
+        return roundup(min(1.08 * (impact + exploit), 10))
+    except Exception:
+        return None
+
+_SEV_FROM_SCORE = [(9.0, "حرجة"), (7.0, "عالية"), (4.0, "متوسطة"),
+                   (0.1, "منخفضة"), (0.0, "لا تأثير")]
+_SEV_FROM_LABEL = {"critical": "حرجة", "high": "عالية",
+                    "moderate": "متوسطة", "medium": "متوسطة",
+                    "low": "منخفضة"}
+
+def _osv_vuln_detail(vuln_id):
+    status, text = _http_get(OSV_VULN_URL + vuln_id, timeout=8,
+                             cap=1048576)
+    if status != 200 or not text:
+        return {"id": vuln_id}
+    try:
+        doc = json.loads(text)
+    except Exception:
+        return {"id": vuln_id}
+    score = None
+    for sev in doc.get("severity") or []:
+        if str(sev.get("type", "")).startswith("CVSS"):
+            score = _cvss3_base_score(sev.get("score", ""))
+            if score is not None:
+                break
+    label = None
+    specific = doc.get("database_specific") or {}
+    if isinstance(specific.get("severity"), str):
+        label = _SEV_FROM_LABEL.get(specific["severity"].lower())
+    if score is not None:
+        label = next(lbl for edge, lbl in _SEV_FROM_SCORE
+                     if score >= edge)
+    fixed = []
+    for affected in doc.get("affected") or []:
+        for rng in affected.get("ranges") or []:
+            for event in rng.get("events") or []:
+                if event.get("fixed"):
+                    fixed.append(str(event["fixed"]))
+    return {"id": vuln_id, "summary": str(doc.get("summary", ""))[:200],
+            "cvss": score, "severity": label,
+            "fixed": fixed[:3],
+            "aliases": [str(a) for a in (doc.get("aliases") or [])[:3]]}
+
+def analyze_dependencies(filename, data):
+    name, deps = parse_dependencies(filename, data)
+    if name is None:
+        return {"status": "unsupported"}
+    if not deps:
+        return {"status": "empty", "filename": name}
+    ecosystem = _DEP_ECOSYSTEMS[name]
+    matches = _osv_lookup(ecosystem, deps)
+    if matches is None:
+        return {"status": "unavailable", "filename": name,
+                "ecosystem": ecosystem, "packages_checked": len(deps)}
+    wanted = []
+    for ids in matches.values():
+        for vid in ids:
+            if vid not in wanted:
+                wanted.append(vid)
+    details = {vid: _osv_vuln_detail(vid) for vid in wanted[:25]}
+    counts = {"حرجة": 0, "عالية": 0, "متوسطة": 0, "منخفضة": 0,
+              "غير مصنّفة": 0}
+    vulnerable, total = [], 0
+    for idx in sorted(matches):
+        vulns = []
+        for vid in matches[idx]:
+            d = details.get(vid) or {"id": vid}
+            sev = d.get("severity") or "غير مصنّفة"
+            counts[sev if sev in counts else "غير مصنّفة"] += 1
+            total += 1
+            vulns.append({"id": vid, "severity": sev,
+                          "cvss": d.get("cvss"),
+                          "summary": d.get("summary", ""),
+                          "fixed": d.get("fixed", []),
+                          "aliases": d.get("aliases", [])})
+        vulns.sort(key=lambda v: -(v["cvss"] or 0))
+        vulnerable.append({"name": deps[idx]["name"],
+                           "version": deps[idx]["version"],
+                           "vulns": vulns})
+    points = {"حرجة": 15, "عالية": 8, "متوسطة": 3, "منخفضة": 1,
+              "غير مصنّفة": 2}
+    lost = min(70, sum(points[k] * v for k, v in counts.items()))
+    score = 100 - lost
+    grade = ("ممتاز" if score >= 90 else "جيد" if score >= 75 else
+             "متوسط" if score >= 55 else "ضعيف" if score >= 35 else "حرج")
+    return {"status": "ready", "filename": name, "ecosystem": ecosystem,
+            "packages_checked": len(deps), "vulnerable": vulnerable,
+            "counts": counts, "total_vulns": total,
+            "details_capped": len(wanted) > 25,
+            "score": {"score": score, "grade": grade}}
+
+def valid_sca_permit(value: Optional[str], sha256: str) -> bool:
+    if not value or not PERMIT_SECRET: return False
+    try:
+        payload, signature = value.split(".", 1)
+        expected = hmac.new(PERMIT_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        if not hmac.compare_digest(expected, supplied): return False
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return (data.get("kind") == "sca" and data.get("sha256") == sha256
+                and bool(data.get("id")) and isinstance(data.get("exp"), (int, float))
+                and data["exp"] > time.time() * 1000)
+    except Exception: return False
+
+SCA_MAX_BYTES = 10 * 1024 * 1024
+SCA_SUPPORTED = ("requirements.txt, Pipfile.lock, package-lock.json, "
+                 "yarn.lock, go.mod, Gemfile.lock, composer.lock")
+
+@app.post("/scans/sca")
+async def sca_scan(request: Request, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None), x_dependency_filename: Optional[str] = Header(default=None)):
+    require_auth(authorization)
+    data = await request.body()
+    if not data: raise HTTPException(status_code=400, detail="Empty dependency file.")
+    if len(data) > SCA_MAX_BYTES: raise HTTPException(status_code=413, detail="Dependency file exceeds the 10MB analysis cap.")
+    digest = hashlib.sha256(data).hexdigest()
+    if not valid_sca_permit(x_scan_approval, digest):
+        raise HTTPException(status_code=403, detail="File requires a bot-issued permit bound to its exact SHA-256.")
+    result = analyze_dependencies(x_dependency_filename or "", data)
+    if result.get("status") == "unsupported":
+        raise HTTPException(status_code=400, detail=f"Unsupported dependency file. Supported: {SCA_SUPPORTED}.")
+    return {"status": "completed", "profile": "sca-osv-v1", **result}
+
 COOKIE_FRAMEWORK_HINTS = (
     ("phpsessid", "PHP"), ("jsessionid", "Java"),
     ("asp.net_sessionid", "ASP.NET"), ("aspsessionid", "ASP.NET"),
@@ -1235,7 +1610,8 @@ RISKY_PORTS = {21: "FTP", 23: "Telnet", 2323: "Telnet-alt", 3389: "RDP",
 DB_PORTS = {3306: "MySQL", 5432: "PostgreSQL", 1433: "MSSQL",
             9200: "Elasticsearch", 11211: "Memcached", 5984: "CouchDB"}
 
-def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None):
+def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None,
+               cloud=None):
     """Transparent 0-100 posture score: every deduction is listed so
     the report can show exactly why the score is what it is."""
     score = 100
@@ -1253,7 +1629,7 @@ def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None):
 
     caps = {"_caps": {"nuclei": 40, "tls": 16, "headers": 12,
                       "ports": 24, "email": 22, "takeover": 20, "dns": 12,
-                      "surface": 16}}
+                      "surface": 16, "cloud": 14}}
     nonlocal_score = [score]
     sev_points = {"critical": (15, "نتيجة Nuclei حرجة"), "high": (8, "نتيجة Nuclei عالية"),
                   "medium": (3, "نتيجة Nuclei متوسطة"), "low": (1, "نتيجة Nuclei منخفضة")}
@@ -1352,6 +1728,11 @@ def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None):
                           f"{host['host']}: "
                           f"{', '.join(js['internal_addresses'][:3])}",
                        "surface", caps)
+    if cloud and cloud.get("status") == "ready":
+        for b in cloud.get("exposed") or []:
+            deduct(10, f"مخزن سحابي مفتوح للعامة: {b.get('name')} "
+                       f"({b.get('provider')}) — قائمة الملفات قابلة "
+                       "للقراءة دون مصادقة", "cloud", caps)
     final = max(0, nonlocal_score[0])
     grade = ("ممتاز" if final >= 90 else "جيد" if final >= 75 else
              "متوسط" if final >= 55 else "ضعيف" if final >= 35 else "حرج")
@@ -1417,7 +1798,10 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
     email = email_security(base)
     dns_audit = dns_deep_audit(base)
     takeover = subdomain_takeover_check(candidates)
-    score = full_score(assessed, ports_by_ip, email, dns_audit, takeover)
+    cloud = cloud_storage_check(base) if time.time() - started <= 1250 \
+        else {"status": "skipped_budget"}
+    score = full_score(assessed, ports_by_ip, email, dns_audit, takeover,
+                       cloud)
     priorities = [d["label"] for d in score["deductions"][:8]]
     return {"status": "completed", "target": host, "base_domain": base,
             "resolved_ips": ips,
@@ -1429,13 +1813,15 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             "dns": dns_records(host),
             "hosts": assessed, "ports_by_ip": ports_by_ip,
             "email": email, "dns_audit": dns_audit, "takeover": takeover,
+            "cloud": cloud,
             "score": score, "priorities": priorities,
             "limitations": ["Detection only: identical guardrails to the web assessment (curated Nuclei templates, no intrusive tags, no exploitation).",
                             "Discovery is passive (certificate transparency + resolving wordlist); subdomains that exist but are neither in CT logs nor in the wordlist will not appear.",
                             "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, within one time budget; anything beyond is reported as skipped, never silently dropped.",
                             "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification.",
                             "Deep DNS audit attempts a zone transfer only against the domain's own nameservers; takeover verdicts are labelled confirmed (the service's unclaimed page answered) or likely (the alias target no longer resolves).",
-                            "API/GraphQL checks read public schema documents and ask a GraphQL endpoint only its minimal schema question; JavaScript mining covers same-host scripts only (up to 8 files per host), and secrets are shown by short prefix only."]}
+                            "API/GraphQL checks read public schema documents and ask a GraphQL endpoint only its minimal schema question; JavaScript mining covers same-host scripts only (up to 8 files per host), and secrets are shown by short prefix only.",
+                            "Cloud storage checks probe bucket names derived from the domain on S3, GCS and Azure Blob; a bucket counts as exposed only when an anonymous listing actually succeeds."]}
 
 # ------------------------------------------------- Android APK static analysis
 import io, zipfile
