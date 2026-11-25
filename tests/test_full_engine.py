@@ -241,6 +241,11 @@ class FullScanOrchestrationTests(unittest.TestCase):
                                              "api_endpoints": [],
                                              "internal_addresses": [],
                                              "external_domains": []}), \
+             mock.patch.object(main, "cloud_storage_check",
+                               return_value={"status": "ready",
+                                             "exposed": [],
+                                             "private_existing": 0,
+                                             "candidates_checked": 12}), \
              mock.patch.object(main, "dns_records",
                                return_value={"status": "ready", "records": {}}):
             out = main.full_scan(req, authorization="Bearer test-engine-token",
