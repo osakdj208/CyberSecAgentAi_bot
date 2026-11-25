@@ -384,7 +384,16 @@ def nuclei_scan(host: str):
                "-rl", "25", "-c", "10", "-timeout", "6", "-retries", "1",
                "-max-host-error", "3"]
     if os.path.isdir(NUCLEI_TEMPLATES):
-        command += ["-t", NUCLEI_TEMPLATES]
+        # Load only the web-assessment categories: pointing Nuclei at the
+        # full 14k-template tree costs minutes of startup on small CPUs.
+        chosen = [os.path.join(NUCLEI_TEMPLATES, d)
+                  for d in ("http", "ssl", "dns", "network")]
+        chosen = [d for d in chosen if os.path.isdir(d)]
+        if chosen:
+            for d in chosen:
+                command += ["-t", d]
+        else:
+            command += ["-t", NUCLEI_TEMPLATES]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=480, check=False, shell=False)
     except subprocess.TimeoutExpired:
