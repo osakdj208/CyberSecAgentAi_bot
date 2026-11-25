@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.8.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.9.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -1089,3 +1089,326 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
                             "Discovery is passive (certificate transparency + resolving wordlist); subdomains that exist but are neither in CT logs nor in the wordlist will not appear.",
                             "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, within one time budget; anything beyond is reported as skipped, never silently dropped.",
                             "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification."]}
+
+# ------------------------------------------------- Android APK static analysis
+import io, zipfile
+try:
+    from loguru import logger as _loguru_logger
+    _loguru_logger.disable("androguard")
+except Exception:
+    pass
+try:
+    from androguard.core.apk import APK as _AndroAPK
+except Exception:
+    _AndroAPK = None
+
+APK_MAX_BYTES = 80 * 1024 * 1024
+
+DANGEROUS_PERMISSIONS = {
+    "android.permission.READ_SMS", "android.permission.SEND_SMS",
+    "android.permission.RECEIVE_SMS", "android.permission.READ_CONTACTS",
+    "android.permission.WRITE_CONTACTS", "android.permission.READ_CALL_LOG",
+    "android.permission.WRITE_CALL_LOG", "android.permission.CALL_PHONE",
+    "android.permission.RECORD_AUDIO", "android.permission.CAMERA",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.ACCESS_BACKGROUND_LOCATION",
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.READ_MEDIA_IMAGES", "android.permission.READ_MEDIA_VIDEO",
+    "android.permission.READ_MEDIA_AUDIO", "android.permission.GET_ACCOUNTS",
+    "android.permission.READ_PHONE_STATE", "android.permission.READ_PHONE_NUMBERS",
+    "android.permission.USE_BIOMETRIC", "android.permission.USE_FINGERPRINT",
+    "android.permission.BODY_SENSORS", "android.permission.ACTIVITY_RECOGNITION",
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.REQUEST_INSTALL_PACKAGES",
+    "android.permission.SYSTEM_ALERT_WINDOW",
+    "android.permission.QUERY_ALL_PACKAGES",
+    "android.permission.MANAGE_EXTERNAL_STORAGE",
+    "android.permission.SCHEDULE_EXACT_ALARM",
+}
+
+_SECRET_PATTERNS = [
+    ("AWS access key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("Google API key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
+    ("GitHub token", re.compile(r"gh[pousr]_[0-9A-Za-z]{36,}")),
+    ("Stripe live secret", re.compile(r"sk_live_[0-9A-Za-z]{16,}")),
+    ("Slack token", re.compile(r"xox[baprs]-[0-9A-Za-z\-]{10,}")),
+    ("Private key block",
+     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
+    ("Firebase database URL",
+     re.compile(r"https://[a-z0-9\-]+\.firebaseio\.com")),
+    ("JWT", re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\."
+                       r"[A-Za-z0-9_\-]{8,}")),
+    ("Generic secret assignment",
+     re.compile(r"(?i)(api[_-]?key|secret|passwd|password)\s*[:=]\s*"
+                r"[\"'][0-9A-Za-z\-_/+]{12,}[\"']")),
+]
+_URL_RE = re.compile(r"https?://[^\s\"'<>\)\]]+")
+_NOISE_DOMAINS = ("www.w3.org", "schemas.android.com", "apache.org",
+                  "example.com", "localhost", "127.0.0.1",
+                  "xmlpull.org", "ns.adobe.com")
+_SDK_SIGNATURES = [
+    ("Firebase", "com/google/firebase"),
+    ("Facebook SDK", "com/facebook"),
+    ("AdMob", "com/google/android/gms/ads"),
+    ("Google Analytics", "com/google/android/gms/analytics"),
+    ("Crashlytics", "com/google/firebase/crashlytics"),
+    ("Sentry", "io/sentry"), ("OneSignal", "com/onesignal"),
+    ("Adjust", "com/adjust/sdk"), ("AppsFlyer", "com/appsflyer"),
+    ("Mixpanel", "com/mixpanel"), ("Stripe", "com/stripe/android"),
+    ("OkHttp", "okhttp3"), ("Retrofit", "retrofit2"),
+    ("Glide", "com/bumptech/glide"), ("Room", "androidx/room"),
+    ("Koin", "org/koin"),
+]
+_STRING_RE = re.compile(rb"[\x20-\x7e]{6,}")
+
+def valid_apk_permit(value: Optional[str], sha256: str) -> bool:
+    if not value or not PERMIT_SECRET: return False
+    try:
+        payload, signature = value.split(".", 1)
+        expected = hmac.new(PERMIT_SECRET.encode(), payload.encode(), hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        if not hmac.compare_digest(expected, supplied): return False
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return (data.get("kind") == "apk" and data.get("sha256") == sha256
+                and bool(data.get("id")) and isinstance(data.get("exp"), (int, float))
+                and data["exp"] > time.time() * 1000)
+    except Exception: return False
+
+def _scan_text_for_secrets(text: str, where: str):
+    found = []
+    for label, pattern in _SECRET_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            # Only a short prefix is reported — a report must never
+            # republish the very secret it found.
+            found.append({"type": label, "where": where,
+                          "preview": m.group(0)[:6] + "…"})
+    return found
+
+def _extract_strings(blob: bytes, cap=12_000_000) -> str:
+    parts = []
+    total = 0
+    for m in _STRING_RE.finditer(blob):
+        s = m.group(0).decode("ascii", "replace")
+        parts.append(s)
+        total += len(s)
+        if total > cap:
+            break
+    return "\n".join(parts)
+
+def _apk_facts(data: bytes):
+    """Parse an APK into a plain facts dict (androguard + zip inventory
+    + manifest DOM walk for exported components). Raises ValueError
+    for input that is not a parseable APK."""
+    if _AndroAPK is None:
+        raise RuntimeError("androguard is not installed in this engine image.")
+    try:
+        zipf = zipfile.ZipFile(io.BytesIO(data))
+        names = zipf.namelist()
+    except Exception:
+        raise ValueError("File is not a ZIP/APK archive.")
+    if "AndroidManifest.xml" not in names:
+        raise ValueError("AndroidManifest.xml missing — not an APK.")
+    dex_names = [n for n in names if re.fullmatch(r"classes\d*\.dex", n)]
+    so_names = [n for n in names if n.endswith(".so")]
+    abis = sorted({n.split("/")[1] for n in names
+                   if n.startswith("lib/") and n.count("/") >= 2})
+    try:
+        apk = _AndroAPK(data, raw=True)
+    except Exception as exc:
+        raise ValueError(f"APK parse failed: {type(exc).__name__}")
+    ns = "{http://schemas.android.com/apk/res/android}"
+    counts = {"activities": 0, "services": 0, "receivers": 0, "providers": 0}
+    exported_open, exported_guarded = [], 0
+    flags = {"debuggable": False, "allow_backup": False,
+             "cleartext_traffic": False, "network_config": False}
+    try:
+        root = apk.get_android_manifest_xml()
+        app_el = root.find("application")
+        if app_el is not None:
+            flags["debuggable"] = app_el.get(ns + "debuggable") == "true"
+            flags["allow_backup"] = app_el.get(ns + "allowBackup") == "true"
+            flags["cleartext_traffic"] = \
+                app_el.get(ns + "usesCleartextTraffic") == "true"
+            flags["network_config"] = \
+                app_el.get(ns + "networkSecurityConfig") is not None
+        tag_map = {"activity": "activities", "activity-alias": "activities",
+                   "service": "services", "receiver": "receivers",
+                   "provider": "providers"}
+        for tag, key in tag_map.items():
+            for el in root.iter(tag):
+                counts[key] += 1
+                exp = el.get(ns + "exported")
+                has_filter = el.find("intent-filter") is not None
+                exported = (exp == "true") if exp else \
+                    (has_filter and tag != "provider")
+                if exported:
+                    if el.get(ns + "permission"):
+                        exported_guarded += 1
+                    else:
+                        exported_open.append(el.get(ns + "name") or "?")
+    except Exception:
+        counts = {"activities": len(apk.get_activities()),
+                  "services": len(apk.get_services()),
+                  "receivers": len(apk.get_receivers()),
+                  "providers": len(apk.get_providers())}
+    cert = None
+    try:
+        certs = apk.get_certificates()
+        if certs:
+            c = certs[0]
+            cert = {"subject": str(c.subject.human_friendly),
+                    "issuer": str(c.issuer.human_friendly),
+                    "self_signed": c.issuer == c.subject,
+                    "sha256": str(c.sha256_fingerprint).replace(" ", "")
+                              .replace(":", "").lower(),
+                    "not_after": str(getattr(c, "not_valid_after_utc", None)
+                                     or getattr(c, "not_valid_after", ""))[:10]}
+    except Exception:
+        cert = None
+    per_file_text = {}
+    for name in dex_names:
+        try:
+            per_file_text[name] = _extract_strings(zipf.read(name))
+        except Exception:
+            continue
+    return {"package": apk.get_package(), "app_name": apk.get_app_name(),
+            "version_name": apk.get_androidversion_name(),
+            "version_code": apk.get_androidversion_code(),
+            "min_sdk": apk.get_min_sdk_version(),
+            "target_sdk": apk.get_target_sdk_version(),
+            "main_activity": apk.get_main_activity(),
+            "permissions": sorted(set(apk.get_permissions())),
+            "components": counts,
+            "exported_open": exported_open,
+            "exported_guarded": exported_guarded,
+            "flags": flags, "certificate": cert,
+            "dex_files": dex_names, "native_abis": abis,
+            "native_libs": len(so_names),
+            "file_count": len(names), "per_file_text": per_file_text}
+
+def apk_score(facts):
+    """Transparent 0-100 static-analysis score; every deduction is
+    listed with its reason, bucketed so no single category dominates."""
+    caps = {"config": 39, "secrets": 20, "components": 16,
+            "permissions": 12, "platform": 14}
+    spent = {k: 0 for k in caps}
+    deductions = []
+
+    def deduct(points, label, bucket):
+        take = min(points, caps[bucket] - spent[bucket])
+        if take > 0:
+            spent[bucket] += take
+            deductions.append({"points": take, "label": label})
+
+    flags = facts.get("flags") or {}
+    if flags.get("debuggable"):
+        deduct(25, "التطبيق قابل للتصحيح (debuggable) — خطر جسيم في نسخة إنتاج",
+               "config")
+    if flags.get("cleartext_traffic"):
+        deduct(10, "حركة HTTP الواضحة مسموحة (usesCleartextTraffic)", "config")
+    if flags.get("allow_backup"):
+        deduct(4, "النسخ الاحتياطي مسموح (allowBackup) — بيانات التطبيق "
+                  "قابلة للاستخراج عبر ADB", "config")
+    secret_types = {s["type"] for s in facts.get("secrets") or []}
+    for t in sorted(secret_types):
+        deduct(10, f"نمط سرّي مدمج محتمل: {t}", "secrets")
+    for name in facts.get("exported_open") or []:
+        deduct(4, f"مكوّن مكشوف بلا حماية: {name}", "components")
+    dangerous = facts.get("dangerous_permissions") or []
+    for perm in dangerous:
+        deduct(2, f"صلاحية خطيرة: {perm.split('.')[-1]}", "permissions")
+    try:
+        target = int(facts.get("target_sdk") or 0)
+    except (TypeError, ValueError):
+        target = 0
+    if 0 < target < 26:
+        deduct(6, f"SDK الهدف قديم ({target}) — بلا حمايات المنصة الحديثة",
+               "platform")
+    cert = facts.get("certificate") or {}
+    if cert.get("not_after") and cert["not_after"] < \
+            time.strftime("%Y-%m-%d", time.gmtime()):
+        deduct(8, "شهادة توقيع التطبيق منتهية الصلاحية", "platform")
+    final = max(0, 100 - sum(spent.values()))
+    grade = ("ممتاز" if final >= 90 else "جيد" if final >= 75 else
+             "متوسط" if final >= 55 else "ضعيف" if final >= 35 else "حرج")
+    deductions.sort(key=lambda d: -d["points"])
+    return {"score": final, "grade": grade, "deductions": deductions[:12]}
+
+def analyze_apk(data: bytes):
+    facts = _apk_facts(data)
+    sha = hashlib.sha256(data).hexdigest()
+    facts["dangerous_permissions"] = [
+        p for p in facts["permissions"] if p in DANGEROUS_PERMISSIONS]
+    secrets = []
+    blob = ""
+    for name, text in (facts.get("per_file_text") or {}).items():
+        secrets += _scan_text_for_secrets(text, name)
+        blob += text + "\n"
+    urls = set(_URL_RE.findall(blob))
+    urls = {u.rstrip(".,;") for u in urls
+            if not any(d in u for d in _NOISE_DOMAINS)}
+    cleartext = sorted(u for u in urls if u.startswith("http://"))[:15]
+    domains = {}
+    for u in urls:
+        try:
+            host = urllib.parse.urlparse(u).netloc
+        except Exception:
+            continue
+        if host:
+            domains[host] = domains.get(host, 0) + 1
+    top_domains = sorted(domains.items(), key=lambda kv: -kv[1])[:8]
+    sdks = [label for label, path in _SDK_SIGNATURES
+            if ("L" + path) in blob or path.replace("/", ".") in blob]
+    facts.pop("per_file_text", None)
+    facts["secrets"] = secrets
+    score = apk_score(facts)
+    return {"status": "completed",
+            "profile": "approved-apk-static-analysis-v1",
+            "sha256": sha, "size_bytes": len(data),
+            "app": {k: facts.get(k) for k in
+                    ("package", "app_name", "version_name", "version_code",
+                     "min_sdk", "target_sdk", "main_activity")},
+            "permissions": {"total": len(facts["permissions"]),
+                            "dangerous": facts["dangerous_permissions"],
+                            "all": facts["permissions"][:60]},
+            "components": {**facts["components"],
+                           "exported_open": facts["exported_open"][:15],
+                           "exported_guarded": facts["exported_guarded"]},
+            "flags": facts["flags"],
+            "secrets": secrets[:10],
+            "urls": {"total": len(urls), "cleartext": cleartext,
+                     "top_domains": top_domains},
+            "sdks": sdks,
+            "native_abis": facts["native_abis"],
+            "dex_files": len(facts["dex_files"]),
+            "certificate": facts["certificate"],
+            "score": score,
+            "limitations": [
+                "Static analysis only: the app is never installed or run; "
+                "runtime behaviour, server-side logic and obfuscated code "
+                "can hide things a static pass cannot see.",
+                "Secret patterns are candidates for the owner to verify; "
+                "only a 6-character prefix is ever reported.",
+                "Exported-component defaults follow the manifest rules "
+                "(explicit attribute, else intent-filter presence)."]}
+
+@app.post("/scans/apk")
+async def apk_scan(request: Request, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
+    require_auth(authorization)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+    if len(body) > APK_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="APK exceeds the analysis size cap.")
+    sha = hashlib.sha256(body).hexdigest()
+    if not valid_apk_permit(x_scan_approval, sha):
+        raise HTTPException(status_code=403, detail="Target requires an active admin approval bound to this exact file (SHA-256).")
+    if _AndroAPK is None:
+        raise HTTPException(status_code=503, detail="APK analysis library is not installed in this engine image.")
+    try:
+        return analyze_apk(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
