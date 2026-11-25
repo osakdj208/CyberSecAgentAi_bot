@@ -7,7 +7,11 @@ RUN curl -sfL "https://github.com/projectdiscovery/nuclei/releases/download/v${N
     && unzip -o /tmp/nuclei.zip -d /usr/local/bin nuclei \
     && chmod +x /usr/local/bin/nuclei && rm /tmp/nuclei.zip
 # Template library (build-time download; the engine reports honestly if absent).
+# Prune non-web categories to keep scanner startup fast on small CPUs.
 RUN nuclei -update-templates -update-template-dir /opt/nuclei-templates || true
+RUN rm -rf /opt/nuclei-templates/javascript /opt/nuclei-templates/code \
+           /opt/nuclei-templates/dast /opt/nuclei-templates/headless \
+           /opt/nuclei-templates/file /opt/nuclei-templates/cloud || true
 RUN chmod -R a+rX /opt/nuclei-templates 2>/dev/null || true
 WORKDIR /srv
 COPY requirements.txt .
