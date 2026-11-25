@@ -381,13 +381,16 @@ def nuclei_scan(host: str):
                "-jsonl", "-silent", "-nc", "-ni", "-duc",
                "-severity", "low,medium,high,critical",
                "-etags", "dos,intrusive,fuzz,brute-force",
-               "-rl", "25", "-c", "10", "-timeout", "6", "-retries", "1",
+               "-rl", "25", "-c", "5", "-timeout", "6", "-retries", "1",
                "-max-host-error", "3"]
     if os.path.isdir(NUCLEI_TEMPLATES):
-        # Load only the web-assessment categories: pointing Nuclei at the
-        # full 14k-template tree costs minutes of startup on small CPUs.
-        chosen = [os.path.join(NUCLEI_TEMPLATES, d)
-                  for d in ("http", "ssl", "dns", "network")]
+        # Load only curated web-assessment template sets (~3.2k templates):
+        # the full tree costs minutes of startup and more RAM than a small
+        # free-tier instance has (it OOM-restarted the box in live testing).
+        rel_dirs = ("http/exposures", "http/misconfiguration",
+                    "http/vulnerabilities", "http/takeovers",
+                    "http/miscellaneous", "ssl", "dns", "network")
+        chosen = [os.path.join(NUCLEI_TEMPLATES, d) for d in rel_dirs]
         chosen = [d for d in chosen if os.path.isdir(d)]
         if chosen:
             for d in chosen:
