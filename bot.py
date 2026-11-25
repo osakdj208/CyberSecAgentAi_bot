@@ -20,6 +20,7 @@ Stdlib only: no pip installs needed. Config comes from environment variables
 import base64
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import os
@@ -53,7 +54,11 @@ CATALOG_NOTE = (
     "الصفحات والروابط + بحث ساكن عن أصل الخادم خلف Cloudflare + فحص اختياري "
     "بجلسة حساب اختبار. "
     "(4) فحص خادم الأصل مباشرة بهوية الموقع + بصمة مرور متفق عليها لعبور "
-    "جدران الحماية بتصريح المالك. بقية أدوات الكتالوج في المشروع الأصلي "
+    "جدران الحماية بتصريح المالك. "
+    "(5) بطاقة حساب تيليجرام: بطاقة معلومات عامة لأي حساب أو قناة أو مجموعة "
+    "عامة (الاسم والنوع وعدد الأعضاء والوصف العام + تقدير تقريبي لتاريخ "
+    "الإنشاء من نطاق المعرف الرقمي) — بيانات منشورة علناً فقط. "
+    "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
 )
@@ -508,6 +513,7 @@ MAIN_KB = kb([
     [("🔎 طلب فحص جديد", "new_scan")],
     [("🌐 فحص موقع شامل", "web_scan")],
     [("🎯 فحص خادم الأصل", "origin_scan")],
+    [("🪪 بطاقة حساب تيليجرام", "tg_card")],
     [("📋 طلباتي", "my_requests"), ("🩺 حالة المحرك", "health")],
     [("🧰 كتالوج الأدوات", "catalog")],
 ])
@@ -524,6 +530,192 @@ AUTH_SECRETS = {}
 # keyed by request id: (header_name, header_value). Same memory-only
 # lifecycle as AUTH_SECRETS: never persisted, dropped at use or rejection.
 PASS_SECRETS = {}
+
+
+# ---------------------------------------------------------------- tg card
+# Public Telegram account card (catalogue item W8): public data only — the
+# public t.me preview page plus Bot API getChat for public chats. Telegram
+# does not publish real creation dates, so the creation period is an
+# approximate range inferred from the numeric ID and always labelled as
+# an estimate.
+
+TG_ID_DATE_RANGES = [
+    (10_000_000, "2013 – 2014"),
+    (50_000_000, "2014 – 2015"),
+    (100_000_000, "2015 – 2016"),
+    (200_000_000, "2016 – 2017"),
+    (400_000_000, "2017 – 2019"),
+    (700_000_000, "2019 – 2020"),
+    (1_100_000_000, "2020 – 2021"),
+    (1_700_000_000, "2021 – 2022"),
+    (2_600_000_000, "2022 – 2023"),
+    (4_000_000_000, "2023 – 2024"),
+]
+
+TG_KIND_LABELS = {"channel": "قناة", "supergroup": "مجموعة خارقة",
+                  "group": "مجموعة", "private": "مستخدم", "bot": "بوت"}
+
+
+def estimate_creation_period(user_id):
+    """Approximate account-creation period from the numeric ID range."""
+    if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        return None
+    for upper, label in TG_ID_DATE_RANGES:
+        if user_id < upper:
+            return label
+    return "2024 – 2026"
+
+
+def parse_tg_query(text):
+    """Parse a card query: @username / t.me link / bare username / numeric ID.
+
+    Returns ("username", name) or ("id", int) or None."""
+    value = (text or "").strip()
+    m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,32})", value)
+    if m:
+        return ("username", m.group(1))
+    value = value.lstrip("@").strip()
+    if re.fullmatch(r"-?\d{5,20}", value):
+        return ("id", int(value))
+    if re.fullmatch(r"[A-Za-z0-9_]{5,32}", value):
+        return ("username", value)
+    return None
+
+
+def _meta_content(page, prop):
+    m = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % prop, page)
+    if not m:
+        m = re.search(r'<meta[^>]+content="([^"]*)"[^>]+property="%s"' % prop, page)
+    return html.unescape(m.group(1)).strip() if m else ""
+
+
+def parse_tme_page(page):
+    """Extract public fields from a t.me/<username> preview page."""
+    if not page:
+        return {}
+    info = {}
+    title = _meta_content(page, "og:title")
+    if title and title != "Telegram":
+        info["name"] = title
+    desc = _meta_content(page, "og:description")
+    if desc:
+        info["description"] = desc
+    m = re.search(r'<div class="tgme_page_extra">(.+?)</div>', page, re.S)
+    if m:
+        extra = re.sub(r"<[^>]+>", " ", m.group(1))
+        info["extra"] = re.sub(r"\s+", " ", html.unescape(extra)).strip()
+    if "subscribers" in info.get("extra", ""):
+        info["kind_hint"] = "channel"
+    elif "members" in info.get("extra", ""):
+        info["kind_hint"] = "group"
+    if "What can this bot do?" in page:
+        info["kind_hint"] = "bot"
+        m = re.search(r'<div class="tgme_page_description">(.+?)</div>',
+                      page, re.S)
+        if m:
+            about = re.sub(r"<[^>]+>", " ", m.group(1))
+            about = re.sub(r"\s+", " ", html.unescape(about)).strip()
+            if about:
+                info["description"] = about
+    return info
+
+
+def fetch_tme_page(username):
+    req = urllib.request.Request(
+        f"https://t.me/{username}",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; CyberSecAgentBot/1.0)"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def tg_card_lookup(query):
+    """Build the public Telegram card text for a parsed query."""
+    kind, value = query
+    username = value if kind == "username" else None
+    numeric_id = value if kind == "id" else None
+    chat = None
+    page_info = {}
+    chat_ref = f"@{username}" if username else numeric_id
+    try:
+        res = tg("getChat", chat_id=chat_ref, _http_timeout=30)
+        if res.get("ok"):
+            chat = res["result"]
+    except Exception:
+        chat = None
+    if username:
+        page_info = parse_tme_page(fetch_tme_page(username))
+    if chat:
+        numeric_id = chat.get("id", numeric_id)
+        username = chat.get("username") or username
+
+    name = None
+    if chat:
+        name = chat.get("title") or " ".join(
+            x for x in [chat.get("first_name"), chat.get("last_name")]
+            if x) or None
+    if not name:
+        name = page_info.get("name")
+
+    kind_label = None
+    if chat and chat.get("type") in TG_KIND_LABELS:
+        kind_label = TG_KIND_LABELS[chat["type"]]
+    if page_info.get("kind_hint") == "bot" or (
+            username and username.lower().endswith("bot")):
+        kind_label = "بوت"
+    elif page_info.get("kind_hint") in ("channel", "group"):
+        kind_label = TG_KIND_LABELS[page_info["kind_hint"]]
+    if not kind_label and username:
+        kind_label = "مستخدم"
+    if not kind_label and numeric_id is not None and numeric_id < 0:
+        kind_label = "قناة/مجموعة (من صيغة المعرف)"
+
+    members = None
+    if chat and chat.get("type") in ("channel", "supergroup", "group"):
+        try:
+            res = tg("getChatMemberCount", chat_id=chat["id"],
+                     _http_timeout=30)
+            if res.get("ok"):
+                members = res["result"]
+        except Exception:
+            members = None
+
+    description = None
+    if chat and chat.get("description"):
+        description = chat["description"]
+    elif page_info.get("description"):
+        description = page_info["description"]
+
+    if not name and not chat and not page_info and numeric_id is None:
+        return ("🪪 لم أجد بيانات عامة لهذا المعرف — قد يكون غير موجود "
+                "أو غير عام. البيانات الخاصة لا تُجمع ولا تُعرض أبداً.")
+
+    lines = ["🪪 بطاقة حساب تيليجرام (بيانات عامة)"]
+    if name:
+        lines.append(f"الاسم: {name}")
+    if username:
+        lines.append(f"المعرف: @{username}")
+    if numeric_id is not None:
+        lines.append(f"المعرف الرقمي: {numeric_id}")
+    if kind_label:
+        lines.append(f"النوع: {kind_label}")
+    if members is not None:
+        lines.append(f"الأعضاء/المشتركون: {members:,}")
+    elif page_info.get("extra"):
+        lines.append(f"إحصائية عامة: {page_info['extra']}")
+    if numeric_id is not None and numeric_id > 0:
+        period = estimate_creation_period(numeric_id)
+        if period:
+            lines.append(
+                f"تاريخ الإنشاء التقديري: حوالي {period} "
+                "(تقدير تقريبي من نطاق المعرف الرقمي — تيليجرام لا ينشر "
+                "التاريخ الحقيقي)")
+    if description:
+        lines.append(f"الوصف العام: {description[:400]}")
+    lines.append("المصدر: الصفحة العامة t.me وواجهة تيليجرام الرسمية.")
+    return "\n".join(lines)
 
 
 def handle_message(msg):
@@ -694,6 +886,20 @@ def handle_message(msg):
                            cookie=state.get("cookie"),
                            pass_pair=parse_pass_pair(text))
         return
+    if state and state["step"] == "tg_await_query":
+        query = parse_tg_query(text)
+        if not query:
+            send(chat_id, "❌ أرسل معرفاً صحيحاً: @username أو رابط t.me "
+                          "أو معرفاً رقمياً، أو /start للإلغاء.")
+            return
+        STATE.pop(chat_id, None)
+        send(chat_id, "🔎 جارٍ جلب البيانات العامة…")
+        try:
+            card = tg_card_lookup(query)
+        except Exception as exc:
+            card = f"❌ تعذّر إكمال البحث: {exc}"
+        send(chat_id, card, MAIN_KB)
+        return
     send(chat_id, "اختر من القائمة، أو أرسل /start للبدء.", MAIN_KB)
 
 
@@ -863,6 +1069,12 @@ def handle_callback(cb):
                       "Cloudflare.\nأرسل اسم نطاق الموقع (مثال: example.com).\n"
                       "تنبيه: لا ترسل إلا موقعاً تملكه أو لديك تصريح مكتوب لفحصه، "
                       "وعنوان أصله يزوّده مالكه.")
+    elif data == "tg_card":
+        STATE[chat_id] = {"step": "tg_await_query"}
+        send(chat_id, "🪪 بطاقة حساب تيليجرام: أرسل المعرف (@username) أو "
+                      "رابط t.me أو المعرف الرقمي لحساب أو قناة أو مجموعة "
+                      "عامة.\nأعرض البيانات العامة فقط: الاسم والنوع وعدد "
+                      "الأعضاء والوصف العام وتقديراً تقريبياً لتاريخ الإنشاء.")
     elif data == "health":
         show_health(chat_id)
     elif data == "my_requests":
