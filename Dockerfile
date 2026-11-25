@@ -26,7 +26,7 @@ RUN chmod -R a+rX /opt/nuclei-templates 2>/dev/null || true
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py bot.py start.sh ./
+COPY main.py bot.py tgdeep.py start.sh ./
 RUN chmod +x start.sh && useradd --create-home --uid 10001 runner
 USER runner
 EXPOSE 10000
