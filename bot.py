@@ -688,6 +688,49 @@ def format_full_report(req, result) -> str:
         elif email.get("has_mx"):
             lines.append(f"  DKIM: لم يُعثر على مفاتيح بين {dkim.get('selectors_checked')} "
                          "محدداً شائعاً فُحص")
+    dns_audit = result.get("dns_audit") or {}
+    if dns_audit.get("status") == "ready":
+        lines.append("\n🛡️ تدقيق DNS العميق:")
+        axfr = dns_audit.get("axfr") or {}
+        if axfr.get("vulnerable"):
+            bad = [a for a in axfr.get("attempts") or [] if a.get("allowed")]
+            lines.append("  ⚠️ نقل المنطقة AXFR مفتوح عند: " +
+                         "، ".join(f"{a.get('nameserver')} "
+                                   f"({a.get('records')} سجلاً)"
+                                   for a in bad) +
+                         " — خريطة DNS كاملة مكشوفة لأي شخص")
+        else:
+            lines.append("  نقل المنطقة AXFR: مرفوض من كل خوادم الأسماء "
+                         "المفحوصة ✅")
+        dnssec = dns_audit.get("dnssec") or {}
+        lines.append("  DNSSEC: " + ("موقّع ✅" if dnssec.get("signed")
+                                     else "غير موقّع (ملاحظة تصليب، ليست ثغرة)"))
+        caa = dns_audit.get("caa") or {}
+        if caa.get("present"):
+            lines.append("  CAA: موجود — " + "؛ ".join(caa.get("records") or []))
+        else:
+            lines.append("  CAA: غائب — أي هيئة شهادات تستطيع إصدار شهادات "
+                         "لهذا النطاق")
+    takeover = result.get("takeover") or {}
+    if takeover.get("status") == "ready":
+        findings = takeover.get("findings") or []
+        lines.append("\n🎯 فحص الاستيلاء على النطاقات الفرعية:")
+        if findings:
+            for f in findings:
+                if f.get("verdict") == "confirmed":
+                    lines.append(f"  🔴 مؤكد: {f.get('host')} ← "
+                                 f"{f.get('service')} غير مُدّعاة "
+                                 f"({f.get('cname_target')}) — أي شخص يستطيع "
+                                 "حجزها وانتحال الاسم")
+                else:
+                    lines.append(f"  🟠 محتمل: {f.get('host')} ← "
+                                 f"{f.get('service')} "
+                                 f"({f.get('cname_target')}) — الهدف لا يُحلّ، "
+                                 "راجِع ملكية الخدمة")
+        else:
+            lines.append(f"  لا نطاقات معلّقة قابلة للاستيلاء بين "
+                         f"{takeover.get('checked', 0)} اسماً بأسماء مستعارة "
+                         "فُحصت ✅")
     hosts = result.get("hosts") or []
     if hosts:
         lines.append("\n🖥️ المضيفون المقيّمون:")
@@ -743,7 +786,9 @@ def format_full_report(req, result) -> str:
     lines.append("\nالحدود: اكتشاف ساكن (شهادات + كلمات شائعة محلولة فعلياً)، "
                  "حدود معلنة: حتى 10 مضيفين تُقاس طبقاتهم، 3 منهم بفحص Nuclei "
                  "كامل، و4 عناوين بفحص منافذ — والمتجاوز يُعلن متخطّى لا يُحذف "
-                 "بصمت. الدرجة هيورستيك شفاف: كل خصم مسبّب في التقرير.")
+                 "بصمت. تدقيق DNS العميق يجرّب نقل المنطقة من خوادم أسماء "
+                 "النطاق نفسه فقط، وأحكام الاستيلاء موسومة بقوة دليلها "
+                 "(مؤكد/محتمل). الدرجة هيورستيك شفاف: كل خصم مسبّب في التقرير.")
     return "\n".join(lines)
 
 
