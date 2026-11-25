@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.9.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.10.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -913,6 +913,166 @@ def email_security(domain: str):
     out["dkim"] = {"selectors_checked": len(DKIM_SELECTORS), "found": found}
     return out
 
+# --------------------------- Phase C1: takeover detection + deep DNS audit
+try:
+    import dns.query as _dns_query
+    import dns.zone as _dns_zone
+except Exception:
+    _dns_query = None
+    _dns_zone = None
+
+# Dangling-CNAME services and the body fingerprints of their unclaimed-site
+# pages. A candidate is only ever reported with its evidence level:
+# "confirmed" when the service's own unclaimed page answered, "likely"
+# when the alias target no longer resolves at all. A name that answers
+# normally is in use and is never reported.
+TAKEOVER_SERVICES = [
+    ("github.io", "GitHub Pages",
+     ["There isn't a GitHub Pages site here"]),
+    ("herokuapp.com", "Heroku", ["No such app"]),
+    ("s3.amazonaws.com", "Amazon S3",
+     ["NoSuchBucket", "The specified bucket does not exist"]),
+    ("blob.core.windows.net", "Azure Blob Storage",
+     ["BlobNotFound", "ContainerNotFound",
+      "The specified blob does not exist",
+      "The specified container does not exist"]),
+    ("azurewebsites.net", "Azure App Service",
+     ["404 Web Site not found"]),
+    ("myshopify.com", "Shopify",
+     ["Sorry, this shop is currently unavailable"]),
+    ("ghost.io", "Ghost",
+     ["The thing you were looking for is no longer here"]),
+    ("surge.sh", "Surge", ["project not found"]),
+    ("bitbucket.io", "Bitbucket", ["Repository not found"]),
+    ("fastly.net", "Fastly", ["Fastly error: unknown domain"]),
+    ("pantheonsite.io", "Pantheon", ["404 Unknown Site"]),
+    ("netlify.app", "Netlify", ["Not Found - Request ID"]),
+    ("gitlab.io", "GitLab Pages",
+     ["The page you're looking for could not be found"]),
+    ("wordpress.com", "WordPress.com", ["Do you want to register"]),
+]
+
+def _dns_resolver():
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 4
+    resolver.lifetime = 6
+    return resolver
+
+def _cname_chain(resolver, name, depth=5):
+    chain, current = [], name
+    for _ in range(depth):
+        try:
+            answers = resolver.resolve(current, "CNAME")
+        except Exception:
+            break
+        target = str(answers[0].target).rstrip(".").lower()
+        if not target or target in chain:
+            break
+        chain.append(target)
+        current = target
+    return chain
+
+def _fetch_text(url, timeout=5, cap=65536):
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(cap).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.read(cap).decode("utf-8", "ignore")
+        except Exception:
+            return ""
+    except Exception:
+        return ""
+
+def _takeover_match(chain):
+    for target in chain:
+        for suffix, service, markers in TAKEOVER_SERVICES:
+            if target == suffix or target.endswith("." + suffix):
+                return target, service, markers
+    return None, None, []
+
+def subdomain_takeover_check(hosts):
+    """Dangling-CNAME / subdomain-takeover detection over the already
+    discovered names. Detection only: at most one bounded HTTP fetch per
+    candidate, and every verdict is labelled by its evidence strength."""
+    if dns is None:
+        return {"status": "unavailable",
+                "note": "dnspython not installed in this engine image."}
+    resolver = _dns_resolver()
+    findings, checked = [], 0
+    for host in hosts[:20]:
+        chain = _cname_chain(resolver, host)
+        if not chain:
+            continue
+        checked += 1
+        target, service, markers = _takeover_match(chain)
+        if not service:
+            continue
+        evidence = None
+        for scheme in ("https", "http"):
+            body = _fetch_text(f"{scheme}://{host}/")
+            if body:
+                evidence = next((m for m in markers if m in body), None)
+                break
+        if evidence:
+            findings.append({"host": host, "service": service,
+                             "cname_target": target, "verdict": "confirmed",
+                             "evidence": evidence})
+        elif not _resolve_quiet(host) and not _resolve_quiet(target):
+            findings.append({"host": host, "service": service,
+                             "cname_target": target, "verdict": "likely",
+                             "evidence": "alias target no longer resolves"})
+    return {"status": "ready", "checked": checked, "findings": findings}
+
+def _try_axfr(domain, ns_host):
+    """One bounded zone-transfer attempt against one of the domain's own
+    nameservers. Returns (allowed, record_count)."""
+    if _dns_zone is None or _dns_query is None:
+        return False, 0
+    ns_ips = _resolve_quiet(ns_host)
+    if not ns_ips:
+        return False, 0
+    try:
+        zone = _dns_zone.from_xfr(
+            _dns_query.xfr(ns_ips[0], domain, timeout=5, lifetime=8))
+        return True, sum(1 for _ in zone.iterate_rdatasets())
+    except Exception:
+        return False, 0
+
+def _record_texts(resolver, name, rtype):
+    try:
+        return [r.to_text() for r in resolver.resolve(name, rtype)]
+    except Exception:
+        return []
+
+def dns_deep_audit(domain):
+    """Deep DNS audit: zone-transfer attempts against the domain's own
+    nameservers only, DNSSEC signing state, and CAA issuance policy."""
+    if dns is None:
+        return {"status": "unavailable",
+                "note": "dnspython not installed in this engine image."}
+    resolver = _dns_resolver()
+    nameservers = sorted({t.rstrip(".").lower() for t in
+                          _record_texts(resolver, domain, "NS")})
+    ds = _record_texts(resolver, domain, "DS")
+    dnskey = _record_texts(resolver, domain, "DNSKEY")
+    caa = _record_texts(resolver, domain, "CAA")
+    attempts = []
+    for ns_host in nameservers[:3]:
+        allowed, count = _try_axfr(domain, ns_host)
+        attempts.append({"nameserver": ns_host, "allowed": allowed,
+                         "records": count if allowed else 0})
+    return {"status": "ready",
+            "nameservers": nameservers[:6],
+            "axfr": {"vulnerable": any(a["allowed"] for a in attempts),
+                     "attempts": attempts},
+            "dnssec": {"signed": bool(ds or dnskey),
+                       "ds_present": bool(ds),
+                       "dnskey_present": bool(dnskey)},
+            "caa": {"present": bool(caa), "records": caa[:5]}}
+
 COOKIE_FRAMEWORK_HINTS = (
     ("phpsessid", "PHP"), ("jsessionid", "Java"),
     ("asp.net_sessionid", "ASP.NET"), ("aspsessionid", "ASP.NET"),
@@ -944,7 +1104,7 @@ RISKY_PORTS = {21: "FTP", 23: "Telnet", 2323: "Telnet-alt", 3389: "RDP",
 DB_PORTS = {3306: "MySQL", 5432: "PostgreSQL", 1433: "MSSQL",
             9200: "Elasticsearch", 11211: "Memcached", 5984: "CouchDB"}
 
-def full_score(hosts, ports_by_ip, email):
+def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None):
     """Transparent 0-100 posture score: every deduction is listed so
     the report can show exactly why the score is what it is."""
     score = 100
@@ -961,7 +1121,7 @@ def full_score(hosts, ports_by_ip, email):
         deductions.append({"points": take, "label": label})
 
     caps = {"_caps": {"nuclei": 40, "tls": 16, "headers": 12,
-                      "ports": 24, "email": 22}}
+                      "ports": 24, "email": 22, "takeover": 20, "dns": 12}}
     nonlocal_score = [score]
     sev_points = {"critical": (15, "نتيجة Nuclei حرجة"), "high": (8, "نتيجة Nuclei عالية"),
                   "medium": (3, "نتيجة Nuclei متوسطة"), "low": (1, "نتيجة Nuclei منخفضة")}
@@ -1021,6 +1181,23 @@ def full_score(hosts, ports_by_ip, email):
         if not (email.get("dkim") or {}).get("found"):
             deduct(2, "لم يُعثر على مفاتيح DKIM للمحددات الشائعة المفحوصة",
                    "email", caps)
+    if takeover and takeover.get("status") == "ready":
+        for f in takeover.get("findings") or []:
+            if f.get("verdict") == "confirmed":
+                deduct(12, f"استيلاء مؤكد على نطاق فرعي: {f.get('host')} "
+                           f"يشير لخدمة غير مُدّعاة ({f.get('service')})",
+                       "takeover", caps)
+            else:
+                deduct(6, f"احتمال استيلاء على نطاق فرعي: {f.get('host')} "
+                          f"يشير لخدمة ({f.get('service')}) لم تعد تُحلّ",
+                       "takeover", caps)
+    if dns_audit and dns_audit.get("status") == "ready":
+        if (dns_audit.get("axfr") or {}).get("vulnerable"):
+            deduct(10, "نقل المنطقة (AXFR) مفتوح — خريطة DNS كاملة مكشوفة "
+                       "لأي شخص", "dns", caps)
+        if not (dns_audit.get("caa") or {}).get("present"):
+            deduct(2, "لا سجلات CAA — أي هيئة شهادات تستطيع إصدار شهادات "
+                      "لهذا النطاق", "dns", caps)
     final = max(0, nonlocal_score[0])
     grade = ("ممتاز" if final >= 90 else "جيد" if final >= 75 else
              "متوسط" if final >= 55 else "ضعيف" if final >= 35 else "حرج")
@@ -1073,7 +1250,9 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             ports_by_ip.append({"ip": ip, "ports": [],
                                 "error": exc.detail})
     email = email_security(base)
-    score = full_score(assessed, ports_by_ip, email)
+    dns_audit = dns_deep_audit(base)
+    takeover = subdomain_takeover_check(candidates)
+    score = full_score(assessed, ports_by_ip, email, dns_audit, takeover)
     priorities = [d["label"] for d in score["deductions"][:8]]
     return {"status": "completed", "target": host, "base_domain": base,
             "resolved_ips": ips,
@@ -1084,11 +1263,13 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
                           "hosts_assessed": [h["host"] for h in assessed]},
             "dns": dns_records(host),
             "hosts": assessed, "ports_by_ip": ports_by_ip,
-            "email": email, "score": score, "priorities": priorities,
+            "email": email, "dns_audit": dns_audit, "takeover": takeover,
+            "score": score, "priorities": priorities,
             "limitations": ["Detection only: identical guardrails to the web assessment (curated Nuclei templates, no intrusive tags, no exploitation).",
                             "Discovery is passive (certificate transparency + resolving wordlist); subdomains that exist but are neither in CT logs nor in the wordlist will not appear.",
                             "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, within one time budget; anything beyond is reported as skipped, never silently dropped.",
-                            "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification."]}
+                            "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification.",
+                            "Deep DNS audit attempts a zone transfer only against the domain's own nameservers; takeover verdicts are labelled confirmed (the service's unclaimed page answered) or likely (the alias target no longer resolves)."]}
 
 # ------------------------------------------------- Android APK static analysis
 import io, zipfile
