@@ -76,16 +76,20 @@ class UnifiedRunAndReportTests(unittest.TestCase):
                 "title": "My App", "description": "Does useful things."}
         with mock.patch.object(bot, "run_approved_full_scan",
                                return_value=FULL_CANNED), \
-             mock.patch.object(bot, "fetch_store_card", return_value=card):
+             mock.patch.object(bot, "fetch_store_card", return_value=card), \
+             mock.patch.object(bot, "download_apk_bytes",
+                               side_effect=RuntimeError("no file in test")):
             bundle = bot.run_approved_unified_scan(req)
         self.assertEqual(bundle["store"]["title"], "My App")
         self.assertEqual(bundle["apk"]["name"], "app.apk")
+        # Phase B: an attached file is now really analyzed; a download
+        # failure is reported honestly instead of a "received" note.
+        self.assertEqual(bundle["apk_analysis"]["status"], "failed")
         text = bot.format_unified_report(req, bundle)
         for needle in ("🧩 التقرير الموحّد", "📱 بطاقة التطبيق من المتجر",
                        "My App", "com.example.app",
-                       "📦 ملف التطبيق مستلم", "app.apk (5.0MB)",
-                       "🏆 درجة الأمان الإجمالية: 90/100",
-                       "ملاحظة المرحلة أ"):
+                       "📦 ملف التطبيق: تعذّر تحليله",
+                       "🏆 درجة الأمان الإجمالية: 90/100"):
             self.assertIn(needle, text)
 
     def test_link_apk_line(self):
