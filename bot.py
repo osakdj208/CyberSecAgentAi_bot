@@ -48,7 +48,10 @@ WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
 CATALOG_NOTE = (
     "الموصّلات الجاهزة فعلياً: (1) فحص IP: Nmap محدود + استخبارات IP سلبية. "
     "(2) فحص موقع شامل: كشف ثغرات Nuclei بقوالب مقيدة + فحص TLS عميق + "
-    "ترويسات أمان HTTP + سجلات DNS. بقية أدوات الكتالوج في المشروع الأصلي "
+    "ترويسات أمان HTTP + سجلات DNS. "
+    "(3) فحص موقع عميق: قوالب CVE الكاملة على دفعات + زحف Katana لاكتشاف "
+    "الصفحات والروابط + بحث ساكن عن أصل الخادم خلف Cloudflare + فحص اختياري "
+    "بجلسة حساب اختبار. بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
 )
@@ -69,6 +72,10 @@ def db():
         conn.execute("ALTER TABLE scan_requests ADD COLUMN kind TEXT DEFAULT 'ip'")
     except sqlite3.OperationalError:
         pass  # column already exists (v2 databases)
+    try:
+        conn.execute("ALTER TABLE scan_requests ADD COLUMN deep INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists (v3 databases)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS tg_updates(
                update_id INTEGER PRIMARY KEY, payload TEXT,
@@ -115,13 +122,13 @@ def save_request(req):
         c.execute(
             "INSERT INTO scan_requests (id, user_id, username, ip, auth_ref,"
             " top_ports, status, created_at, expires_at, result, error,"
-            " proof_file_id, proof_text, kind)"
-            " VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?)",
+            " proof_file_id, proof_text, kind, deep)"
+            " VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?)",
             (req["id"], req["user_id"], req["username"], req["ip"],
              req["auth_ref"], req["top_ports"], req["status"],
              req["created_at"], req["expires_at"],
              req.get("proof_file_id"), req.get("proof_text"),
-             req.get("kind", "ip")),
+             req.get("kind", "ip"), req.get("deep", 0)),
         )
 
 
@@ -293,11 +300,15 @@ def run_approved_web_scan(req):
     ips = resolve_host_ips(req["ip"])
     permit = create_web_permit(req["ip"], ips, req["id"],
                                int(time.time() * 1000) + PERMIT_TTL_MS)
+    deep = bool(req.get("deep"))
+    cookie = AUTH_SECRETS.pop(req["id"], None)  # one-shot: dropped at use
     return engine_call("POST", "/scans/web", body={
         "target_host": req["ip"],
         "authorization_reference": req["auth_ref"],
         "confirm_authorized": True,
-    }, permit=permit, timeout=900)
+        "deep": deep,
+        "auth_cookie": cookie,
+    }, permit=permit, timeout=1500 if deep else 900)
 
 
 SEV_AR = {"critical": "حرجة", "high": "عالية", "medium": "متوسطة",
@@ -306,7 +317,7 @@ SEV_AR = {"critical": "حرجة", "high": "عالية", "medium": "متوسطة"
 
 def format_web_report(req, result) -> str:
     host = result.get("target", req["ip"])
-    lines = [f"✅ اكتمل فحص الموقع {host}",
+    lines = [f"✅ اكتمل فحص الموقع {host} ({'🔬 عميق' if result.get('deep') else '⚡ سريع'})",
              f"المرجع: {req['auth_ref']}  |  الملف: {result.get('profile','')}"]
     ips = result.get("resolved_ips") or []
     if ips:
@@ -361,6 +372,28 @@ def format_web_report(req, result) -> str:
                          f"{f.get('name')} — {f.get('matched_at')}")
     else:
         lines.append(f"الحالة: {nuc.get('status')} — {nuc.get('note','')}")
+    batches = nuc.get("batches") or []
+    if len(batches) > 1:
+        lines.append("دفعات الفحص: " + "، ".join(
+            f"{b.get('label')}: {b.get('total')}" for b in batches
+            if b.get("status") == "ready"))
+    crawl = result.get("crawl") or {}
+    if crawl.get("status") == "ready":
+        lines.append(f"\n🕷️ الزحف العميق: اكتُشفت {crawl.get('total')} صفحة/رابط")
+        for u in (crawl.get("notable") or [])[:8]:
+            lines.append(f"  • {u}")
+    origin = result.get("origin") or {}
+    if origin.get("status") == "ready":
+        lines.append(f"\n🎯 أصل الخادم (بحث ساكن عبر {origin.get('subdomains_checked')} نطاقاً فرعياً):")
+        cands = origin.get("candidates") or []
+        if cands:
+            for c in cands:
+                mark = "يخدم الموقع فعلياً ✅" if c.get("serves_site") else "مرشح غير مؤكد"
+                lines.append(f"  • {c.get('ip')} (عبر {'، '.join(c.get('via_subdomains') or [])}) — {mark}")
+        else:
+            lines.append("  لا مرشحين — الأصل مخفي جيداً خلف الواجهة.")
+    if result.get("authenticated"):
+        lines.append("\n🔑 أُجري الفحص بجلسة حساب اختبار زوّدها المالك لهذا الفحص (لم تُحفظ).")
     lines.append("\nالحدود: كشف فقط بقوالب مقيدة (بلا استغلال ولا وسوم اقتحامية)، "
                  "ونتائج الماسح تقارير أولية يراجعها الأدمن قبل أي إجراء.")
     return "\n".join(lines)
@@ -431,6 +464,11 @@ MAIN_KB = kb([
 
 # per-user conversation state (in-memory; durable data lives in SQLite)
 STATE = {}
+
+# One-shot test-account session cookies for deep web scans, keyed by
+# request id. MEMORY ONLY: never written to the DB, disk, or logs, and
+# dropped the moment the approved scan runs (or the request dies).
+AUTH_SECRETS = {}
 
 
 def handle_message(msg):
@@ -522,22 +560,41 @@ def handle_message(msg):
             proof_text = msg.get("caption") or "صورة إثبات مرفقة"
         elif text and text not in ("تخطي", "skip"):
             proof_text = text[:1000]
-        req = {
-            "id": uuid.uuid4().hex, "user_id": user.get("id"),
-            "username": user.get("username") or user.get("first_name", "?"),
-            "ip": state["ip"], "auth_ref": state["auth_ref"],
-            "proof_file_id": proof_file_id, "proof_text": proof_text,
-            "top_ports": 0, "status": "pending", "kind": "web",
-            "created_at": time.time(),
-            "expires_at": time.time() + APPROVAL_TTL_HOURS * 3600,
-        }
-        save_request(req)
-        STATE.pop(chat_id, None)
-        send(chat_id, f"⏳ تم إنشاء طلب فحص الموقع {req['id'][:8]} للهدف {req['ip']}.\n"
-                      "لن يبدأ أي فحص قبل موافقة الأدمن. ستصلك النتيجة هنا.")
-        notify_admin(req)
+        state.update(step="w_await_depth", proof_file_id=proof_file_id,
+                     proof_text=proof_text)
+        send(chat_id, "اختر عمق الفحص:", kb([
+            [("⚡ سريع — أساسيات + ثغرات شائعة", "wdepth:quick")],
+            [("🔬 عميق — CVE كاملة + زحف + أصل الخادم", "wdepth:deep")]]))
+        return
+    if state and state["step"] == "w_await_cookie":
+        cookie = None
+        if text and text not in ("تخطي", "skip"):
+            cookie = text[:2048]
+        create_web_request(chat_id, user, state, deep=True, cookie=cookie)
         return
     send(chat_id, "اختر من القائمة، أو أرسل /start للبدء.", MAIN_KB)
+
+
+def create_web_request(chat_id, user, state, deep, cookie=None):
+    req = {
+        "id": uuid.uuid4().hex, "user_id": user.get("id"),
+        "username": user.get("username") or user.get("first_name", "?"),
+        "ip": state["ip"], "auth_ref": state["auth_ref"],
+        "proof_file_id": state.get("proof_file_id"),
+        "proof_text": state.get("proof_text"),
+        "top_ports": 0, "status": "pending", "kind": "web",
+        "deep": 1 if deep else 0,
+        "created_at": time.time(),
+        "expires_at": time.time() + APPROVAL_TTL_HOURS * 3600,
+    }
+    save_request(req)
+    if cookie:
+        AUTH_SECRETS[req["id"]] = cookie
+    STATE.pop(chat_id, None)
+    send(chat_id, f"⏳ تم إنشاء طلب فحص الموقع {req['id'][:8]} للهدف {req['ip']} "
+                  f"({'🔬 عميق' if deep else '⚡ سريع'}).\n"
+                  "لن يبدأ أي فحص قبل موافقة الأدمن. ستصلك النتيجة هنا.")
+    notify_admin(req)
 
 
 def show_health(chat_id):
@@ -568,13 +625,19 @@ def notify_admin(req):
     if not ADMIN_ID:
         return
     is_web = req.get("kind") == "web"
+    if is_web and req.get("deep"):
+        scope_line = "النوع: فحص عميق 🔬 (CVE كاملة + زحف + أصل الخادم)" + \
+            (" + جلسة حساب اختبار" if AUTH_SECRETS.get(req["id"]) else "")
+    elif is_web:
+        scope_line = "النوع: ثغرات (Nuclei) + TLS + ترويسات أمان + DNS"
+    else:
+        scope_line = f"المنافذ: {req['top_ports']}"
     send(ADMIN_ID,
          ("🔔 طلب فحص موقع شامل بانتظار قرارك\n" if is_web
           else "🔔 طلب فحص جديد بانتظار قرارك\n")
          + f"الهدف: {req['ip']}\nمن: {req['username']} (ID {req['user_id']})\n"
          f"مرجع التصريح: {req['auth_ref']}\n"
-         + ("النوع: ثغرات (Nuclei) + TLS + ترويسات أمان + DNS\n" if is_web
-            else f"المنافذ: {req['top_ports']}\n")
+         + scope_line + "\n"
          + f"إثبات التصريح: {req.get('proof_text') or 'غير مرفق — تحقق بنفسك قبل الاعتماد'}\n"
          f"رقم الطلب: {req['id'][:8]}",
          kb([[("✅ اعتماد وتنفيذ", f"approve:{req['id']}"),
@@ -613,6 +676,20 @@ def handle_callback(cb):
         show_my_requests(chat_id, user.get("id"))
     elif data == "catalog":
         send(chat_id, "🧰 " + CATALOG_NOTE, MAIN_KB)
+    elif data.startswith("wdepth:"):
+        state = STATE.get(chat_id)
+        if not state or state.get("step") != "w_await_depth":
+            send(chat_id, "انتهت الجلسة، ابدأ من جديد بـ /start")
+            return
+        if data == "wdepth:quick":
+            create_web_request(chat_id, user, state, deep=False)
+        else:
+            state.update(step="w_await_cookie")
+            send(chat_id, "🔬 فحص عميق. خطوة اختيارية أخيرة: إن أردت فحص ما بعد "
+                          "تسجيل الدخول، أرسل كوكيز جلسة حساب اختبار أنشأه مالك "
+                          "الموقع لهذا الغرض. تُستخدم مرة واحدة في الذاكرة فقط "
+                          "ولا تُحفظ في أي قاعدة أو سجل — لكنها ستظهر في محادثة "
+                          "تيليجرام هذه، لذا حساب اختبار فقط. أو أرسل «تخطي».")
     elif data.startswith("ports:"):
         state = STATE.get(chat_id)
         if not state or state.get("step") != "await_ports":
@@ -649,6 +726,7 @@ def handle_callback(cb):
             return
         if action == "reject":
             transition(rid, "pending", "rejected")
+            AUTH_SECRETS.pop(rid, None)
             send(chat_id, f"🚫 رفضت طلب {rid[:8]}.")
             send(req["user_id"], f"🚫 تم رفض طلب فحص {req['ip']} من الأدمن.")
             return
@@ -659,7 +737,9 @@ def handle_callback(cb):
         is_web = req.get("kind") == "web"
         send(chat_id, f"✅ اعتمدت {rid[:8]}، جارٍ الفحص…")
         send(req["user_id"], f"🔄 بدأ فحص {req['ip']}، "
-             + ("قد يستغرق حتى عشر دقائق…" if is_web else "قد يستغرق حتى دقيقتين…"))
+             + ("العميق قد يستغرق حتى ٢٥ دقيقة…" if is_web and req.get("deep")
+                else "قد يستغرق حتى عشر دقائق…" if is_web
+                else "قد يستغرق حتى دقيقتين…"))
         try:
             if is_web:
                 result = run_approved_web_scan(req)
