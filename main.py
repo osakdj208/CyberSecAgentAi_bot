@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.14.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.14.1")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -423,9 +423,12 @@ def _template_dirs(relative):
             if os.path.isdir(os.path.join(NUCLEI_TEMPLATES, r))]
 
 def nuclei_scan(host: str, deep: bool = False, cookie: str = None,
-                extra_targets=None, headers=None, targets_override=None):
+                extra_targets=None, headers=None, targets_override=None,
+                cap: int = 480):
     """Curated detection scan; in deep mode the full CVE tree also runs,
-    one year per bounded batch, so peak memory stays free-tier safe."""
+    one year per bounded batch, so peak memory stays free-tier safe.
+    `cap` bounds the curated run's wall-clock (the full assessment
+    passes a dynamic cap so its hard deadline always holds)."""
     if not NUCLEI_PATH:
         return {"status": "unavailable",
                 "note": "Nuclei binary is not installed in this engine image."}
@@ -433,7 +436,7 @@ def nuclei_scan(host: str, deep: bool = False, cookie: str = None,
     targets = base_targets + [t for t in (extra_targets or [])
                               if t not in base_targets][:30]
     curated = _template_dirs(CURATED_DIRS)
-    merged = _run_nuclei(targets, curated or [NUCLEI_TEMPLATES], cookie, 480, headers=headers)
+    merged = _run_nuclei(targets, curated or [NUCLEI_TEMPLATES], cookie, cap, headers=headers)
     if merged is None:
         return {"status": "unavailable",
                 "note": "Nuclei binary is not installed in this engine image."}
@@ -1053,16 +1056,20 @@ def _takeover_match(chain):
                 return target, service, markers
     return None, None, []
 
-def subdomain_takeover_check(hosts, headers=None):
+def subdomain_takeover_check(hosts, headers=None, deadline_ts=None):
     """Dangling-CNAME / subdomain-takeover detection over the already
     discovered names. Detection only: at most one bounded HTTP fetch per
-    candidate, and every verdict is labelled by its evidence strength."""
+    candidate, and every verdict is labelled by its evidence strength.
+    When `deadline_ts` passes mid-loop the check stops and reports what
+    it actually checked."""
     if dns is None:
         return {"status": "unavailable",
                 "note": "dnspython not installed in this engine image."}
     resolver = _dns_resolver()
     findings, checked = [], 0
     for host in hosts[:20]:
+        if deadline_ts is not None and time.time() > deadline_ts:
+            break
         chain = _cname_chain(resolver, host)
         if not chain:
             continue
@@ -1272,12 +1279,13 @@ _BUCKET_SUFFIXES = ["", "-assets", "-backup", "-backups", "-files",
                     "-media", "-static", "-data", "-uploads", "-images",
                     "-docs", "-public"]
 
-def cloud_storage_check(base):
+def cloud_storage_check(base, deadline_ts=None):
     """Public cloud-storage exposure for bucket names derived from the
     domain: Amazon S3, Google Cloud Storage, Azure Blob. A bucket is
     reported as exposed ONLY when an anonymous listing actually
     succeeds; buckets that exist but are private are counted as an
-    informational note, never flagged as findings."""
+    informational note, never flagged as findings. When `deadline_ts`
+    passes, probing stops and the checked count reflects reality."""
     label = base.split(".")[0].lower()
     nodash = label.replace("-", "")
     names = []
@@ -1288,6 +1296,8 @@ def cloud_storage_check(base):
     out = {"status": "ready", "exposed": [], "private_existing": 0,
            "candidates_checked": 0}
     for name in names:
+        if deadline_ts is not None and time.time() > deadline_ts:
+            break
         out["candidates_checked"] += 1
         status, text = _http_get(f"https://{name}.s3.amazonaws.com/",
                                  timeout=4, cap=32768)
@@ -1309,7 +1319,8 @@ def cloud_storage_check(base):
         elif status == 403:
             out["private_existing"] += 1
     account = nodash[:24]
-    if len(account) >= 3:
+    if len(account) >= 3 and not (
+            deadline_ts is not None and time.time() > deadline_ts):
         out["candidates_checked"] += 1
         status, _ = _http_get(
             f"https://{account}.blob.core.windows.net/?comp=list",
@@ -1317,6 +1328,8 @@ def cloud_storage_check(base):
         if status is not None and status != 404:
             account_private = False
             for name in names:
+                if deadline_ts is not None and time.time() > deadline_ts:
+                    break
                 status, text = _http_get(
                     f"https://{account}.blob.core.windows.net/{name}"
                     "?resttype=container&comp=list",
@@ -1816,20 +1829,26 @@ def collect_version_pairs(assessed, ports_by_ip):
                         f"ترويسة {host.get('host')}")
     return pairs
 
-def version_cve_check(pairs):
+def version_cve_check(pairs, deadline_ts=None):
     """Match detected product versions against NVD. Anonymous NVD
     access allows ~5 requests per 30s, so calls are paced and the
     product list is capped; every kept CVE passed the strict
-    applicability filter above."""
+    applicability filter above. When `deadline_ts` passes, remaining
+    products are reported as unmatched (never queried), not dropped."""
     out = {"status": "ready", "checked": len(pairs), "products": [],
            "clean": [], "unmatched": []}
     first = True
     for pair in pairs[:5]:
+        if deadline_ts is not None and time.time() > deadline_ts:
+            out["unmatched"].append(pair["display"])
+            continue
         vendors = [(pair["vendor"], pair["product"])]
         if (pair["vendor"], pair["product"]) == ("nginx", "nginx"):
             vendors.append(("f5", "nginx"))
         found, seen_ids, queried = [], set(), False
         for vendor, product in vendors:
+            if deadline_ts is not None and time.time() > deadline_ts:
+                break
             cpe = (f"cpe:2.3:a:{vendor}:{product}:"
                    f"{_cpe_version(product, pair['version'])}")
             if not first:
@@ -2129,6 +2148,15 @@ def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None,
     deductions.sort(key=lambda d: -d["points"])
     return {"score": final, "grade": grade, "deductions": deductions[:12]}
 
+# Hard wall-clock budget for one full assessment. Every stage gate and
+# subprocess cap inside full_scan derives from this single deadline, so
+# the engine ALWAYS answers within it (plus one bounded call of slack)
+# instead of running until the caller — or the host instance — gives
+# up. (Lesson of 2026-11-26: an unbounded wolt.com assessment outlived
+# the bot's 1800s wait and the free instance was replaced mid-scan,
+# taking the request record with it.)
+FULL_SCAN_DEADLINE = 1500
+
 @app.post("/scans/full")
 def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
     require_auth(authorization)
@@ -2137,6 +2165,11 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
     pass_headers = _pass_headers(request)
     pass_list = [f"{k}: {v}" for k, v in pass_headers.items()]
     started = time.time()
+    deadline = started + FULL_SCAN_DEADLINE
+
+    def left():
+        return deadline - time.time()
+
     base = host[4:] if host.startswith("www.") else host
 
     discovered = discover_subdomains(base)
@@ -2146,7 +2179,9 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
         if name not in candidates:
             candidates.append(name)
     assessed, all_ips = [], []
-    for name in candidates[:10]:
+    for probe_idx, name in enumerate(candidates[:10]):
+        if probe_idx > 0 and time.time() - started > 420:
+            break
         resolved = _resolve_quiet(name)
         if not resolved:
             continue
@@ -2164,16 +2199,17 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
     live = [h for h in assessed if (h.get("http") or {}).get("status") == "ready"]
     nuclei_done = 0
     for entry in live:
-        if nuclei_done >= 3 or time.time() - started > 1000:
+        if nuclei_done >= 3 or left() <= 300:
             entry["nuclei"] = {"status": "skipped_budget"}
             entry["api"] = {"status": "skipped_budget"}
             entry["js"] = {"status": "skipped_budget"}
             entry["hidden"] = {"status": "skipped_budget"}
             continue
-        entry["nuclei"] = nuclei_scan(entry["host"], deep=False,
-                                      headers=pass_list or None)
+        entry["nuclei"] = nuclei_scan(
+            entry["host"], deep=False, headers=pass_list or None,
+            cap=int(max(60, min(480, left() - 240))))
         nuclei_done += 1
-        if time.time() - started <= 1150:
+        if left() > 240:
             scheme = (entry.get("http") or {}).get("scheme") or "https"
             entry["api"] = api_surface_check(entry["host"], scheme,
                                              headers=pass_headers or None)
@@ -2187,7 +2223,7 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             entry["hidden"] = {"status": "skipped_budget"}
     ports_by_ip = []
     for ip in all_ips[:4]:
-        if time.time() - started > 1250:
+        if left() <= 180:
             break
         try:
             data = nmap_data(ip, 100)
@@ -2198,13 +2234,15 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
                                 "error": exc.detail})
     email = email_security(base)
     dns_audit = dns_deep_audit(base)
-    takeover = subdomain_takeover_check(candidates,
-                                        headers=pass_headers or None)
-    cloud = cloud_storage_check(base) if time.time() - started <= 1250 \
-        else {"status": "skipped_budget"}
+    takeover = subdomain_takeover_check(
+        candidates, headers=pass_headers or None,
+        deadline_ts=deadline - 180)
+    cloud = cloud_storage_check(base, deadline_ts=deadline - 90) \
+        if left() > 150 else {"status": "skipped_budget"}
     pairs = collect_version_pairs(assessed, ports_by_ip)
-    if pairs and time.time() - started <= 1300:
-        version_cves = version_cve_check(pairs)
+    if pairs and left() > 45:
+        version_cves = version_cve_check(pairs,
+                                         deadline_ts=deadline - 15)
     elif pairs:
         version_cves = {"status": "skipped_budget"}
     else:
@@ -2219,6 +2257,7 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             "profile": "approved-full-assessment-v1",
             "pass_used": bool(pass_headers),
             "elapsed_seconds": int(time.time() - started),
+            "deadline_seconds": FULL_SCAN_DEADLINE,
             "discovery": {"subdomains_found": discovered,
                           "hosts_assessed": [h["host"] for h in assessed],
                           "wildcard": {"detected": bool(wildcard_ips),
@@ -2230,7 +2269,7 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             "score": score, "priorities": priorities,
             "limitations": ["Detection only: identical guardrails to the web assessment (curated Nuclei templates, no intrusive tags, no exploitation).",
                             "Discovery is passive (certificate transparency, public scan/archive indexes, resolving wordlist); subdomains that exist but are in none of those sources will not appear.",
-                            "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, within one time budget; anything beyond is reported as skipped, never silently dropped.",
+                            "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, all inside one hard 25-minute wall-clock deadline; every stage's subprocess and loop is capped by the time actually left, and anything that does not fit is reported as skipped, never silently dropped.",
                             "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification.",
                             "Deep DNS audit attempts a zone transfer only against the domain's own nameservers; takeover verdicts are labelled confirmed (the service's unclaimed page answered) or likely (the alias target no longer resolves).",
                             "API/GraphQL checks read public schema documents and ask a GraphQL endpoint only its minimal schema question; JavaScript mining covers same-host scripts only (up to 8 files per host), and secrets are shown by short prefix only.",
