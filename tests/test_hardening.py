@@ -164,7 +164,8 @@ class ExhaustedClockScanTests(unittest.TestCase):
                                  authorization="Bearer test-engine-token",
                                  x_scan_approval="permit")
         self.assertEqual(out["status"], "completed")
-        self.assertEqual(out["deadline_seconds"], main.FULL_SCAN_DEADLINE)
+        self.assertEqual(out["deadline_seconds"],
+                         main._full_scan_bounds()[1]["deadline"])
         self.assertEqual(len(out["hosts"]), 1)
         host = out["hosts"][0]
         self.assertEqual(host["nuclei"]["status"], "skipped_budget")
