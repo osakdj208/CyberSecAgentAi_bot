@@ -84,6 +84,12 @@ CATALOG_NOTE = (
     "وداخل التقييم الشامل أيضاً: كشف استيلاء النطاقات الفرعية، تدقيق "
     "DNS عميق (AXFR/DNSSEC/CAA)، فحص API وGraphQL، تعدين JavaScript، "
     "وكشف التخزين السحابي المكشوف (S3/GCS/Azure). "
+    "(11) بحث عميق في أي عنوان IP (بطاقة فورية): منظمة وASN وبادئة "
+    "معلنة وظهور توجيه BGP وأول ظهور مسجل، اسم عكسي PTR، مؤشرات "
+    "تصنيف (Tor من القائمة الرسمية، بروكسي/استضافة/جوال من قواعد "
+    "ip-api)، نطاقات مستضافة على العنوان من سجلّات عامة، وسمعة بريد "
+    "عبر قوائم DNSBL — استخبارات سلبية من سجلّات عامة فقط، بلا أي "
+    "فحص منافذ (الفحص النشط يبقى بموافقة الأدمن). "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -1153,6 +1159,7 @@ MAIN_KB = kb([
     [("📦 فحص تبعيات مشروع (SCA)", "sca_scan")],
     [("🪪 بطاقة حساب تيليجرام", "tg_card")],
     [("📱 بطاقة رقم هاتف", "phone_card")],
+    [("🔍 بحث عميق في IP", "ip_deep")],
     [("📋 طلباتي", "my_requests"), ("🩺 حالة المحرك", "health")],
     [("🧰 كتالوج الأدوات", "catalog")],
 ])
@@ -1543,6 +1550,253 @@ def phone_card_lookup(text, is_admin=False):
     return "\n".join(lines)
 
 
+def _bot_get_json(url, timeout=12):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _bot_get_text(url, timeout=12, cap=524288):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(cap).decode("utf-8", "replace")
+
+
+_TOR_EXIT_CACHE = {"at": 0.0, "ips": set()}
+
+
+def _tor_exit_set():
+    """Tor's official bulk exit list, cached in memory for an hour."""
+    now = time.time()
+    if now - _TOR_EXIT_CACHE["at"] > 3600 or not _TOR_EXIT_CACHE["ips"]:
+        try:
+            text = _bot_get_text(
+                "https://check.torproject.org/torbulkexitlist",
+                timeout=15)
+            ips = {ln.strip() for ln in text.splitlines() if ln.strip()}
+            if ips:
+                _TOR_EXIT_CACHE.update(at=now, ips=ips)
+        except Exception:
+            pass
+    return _TOR_EXIT_CACHE["ips"]
+
+
+def _ptr_lookup(ip):
+    try:
+        import dns.resolver, dns.reversename
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 4
+        resolver.lifetime = 5
+        answers = resolver.resolve(dns.reversename.from_address(ip),
+                                   "PTR")
+        return str(list(answers)[0]).rstrip(".")
+    except Exception:
+        return None
+
+
+_DNSBL_ZONES = [("zen.spamhaus.org", "Spamhaus ZEN"),
+                ("bl.spamcop.net", "SpamCop"),
+                ("b.barracudacentral.org", "Barracuda"),
+                ("dnsbl.sorbs.net", "SORBS")]
+
+
+def _dnsbl_lookup(ip):
+    """Mail-reputation check (IPv4 only). States per list: listed /
+    clean / blocked / unknown. Spamhaus answers 127.255.255.x when the
+    querying resolver is a public open resolver — that is a refusal,
+    never reported as a listing."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if addr.version != 4:
+        return None
+    try:
+        import dns.resolver
+    except Exception:
+        return []
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 4
+    resolver.lifetime = 5
+    out = []
+    for zone, label in _DNSBL_ZONES:
+        try:
+            answers = resolver.resolve(f"{reversed_ip}.{zone}", "A")
+            codes = [str(a) for a in answers]
+            if any(c.startswith("127.255.255.") for c in codes):
+                out.append((label, "blocked"))
+            else:
+                out.append((label, "listed"))
+        except dns.resolver.NXDOMAIN:
+            out.append((label, "clean"))
+        except Exception:
+            out.append((label, "unknown"))
+    return out
+
+
+def ip_deep_lookup(text):
+    """Deep passive card for any public IP: identity/ASN/BGP routing
+    (RIPEstat), geolocation/ISP (ipwho.is), reverse DNS, classification
+    indicators (Tor official list; proxy/hosting/mobile via ip-api),
+    domains hosted on the address (public records), and mail
+    reputation (DNSBL). Public records only — no active probing; port
+    scanning stays behind the admin-approval gate as always."""
+    try:
+        ip = validate_target(text)
+    except ValueError as exc:
+        return f"❌ {exc}"
+    lines = [f"🔍 بطاقة بحث عميق — {ip}"]
+    ptr = _ptr_lookup(ip)
+    if ptr:
+        lines.append(f"الاسم العكسي (PTR): {ptr}")
+    basics = None
+    try:
+        got = _bot_get_json(f"https://ipwho.is/{ip}")
+        if isinstance(got, dict) and got.get("success"):
+            basics = got
+    except Exception:
+        basics = None
+    if basics:
+        conn = basics.get("connection") or {}
+        loc = "، ".join(x for x in (basics.get("city"),
+                                    basics.get("country")) if x)
+        if loc:
+            lines.append(f"الموقع التقريبي: {loc}")
+        org = conn.get("isp") or conn.get("org")
+        if org:
+            lines.append(f"المزوّد/المنظمة: {org}")
+        if basics.get("type"):
+            lines.append(f"نوع العنوان: {basics['type']}")
+    asn = None
+    try:
+        ni = (_bot_get_json(
+            "https://stat.ripe.net/data/network-info/data.json"
+            f"?resource={ip}") or {}).get("data") or {}
+        if ni.get("prefix"):
+            lines.append(f"بادئة الشبكة المعلنة: {ni['prefix']}")
+        asns = ni.get("asns") or []
+        asn = asns[0] if asns else None
+    except Exception:
+        asn = None
+    if asn:
+        holder = announced = None
+        try:
+            ov = (_bot_get_json(
+                "https://stat.ripe.net/data/as-overview/data.json"
+                f"?resource=AS{asn}", timeout=20) or {}).get("data") or {}
+            holder = ov.get("holder")
+        except Exception:
+            pass
+        try:
+            ap = (_bot_get_json(
+                "https://stat.ripe.net/data/announced-prefixes/data.json"
+                f"?resource=AS{asn}", timeout=20) or {}).get("data") or {}
+            announced = len(ap.get("prefixes") or []) or None
+        except Exception:
+            pass
+        lines.append(f"النظام المستقل: AS{asn}"
+                     + (f" — {holder}" if holder else ""))
+        if announced:
+            lines.append(f"بادئات يعلنها هذا النظام عالمياً: {announced}")
+        try:
+            rs = (_bot_get_json(
+                "https://stat.ripe.net/data/routing-status/data.json"
+                f"?resource={ip}", timeout=20) or {}).get("data") or {}
+            vis = ((rs.get("visibility") or {}).get("v4") or {})
+            if vis.get("ris_peers_seeing") is not None:
+                lines.append(
+                    f"ظهور التوجيه (BGP): تراه "
+                    f"{vis['ris_peers_seeing']} من "
+                    f"{vis.get('total_ris_peers', '?')} نقطة مراقبة "
+                    "RIPE RIS")
+            first_seen = (rs.get("first_seen") or {}).get("time")
+            if first_seen:
+                lines.append(f"أول ظهور مسجّل لهذا التوجيه: "
+                             f"{str(first_seen)[:10]}")
+        except Exception:
+            pass
+    lines.append("🧭 تصنيف الاتصال:")
+    tor_ips = _tor_exit_set()
+    if tor_ips:
+        lines.append(
+            "  Tor: " + ("🔴 عقدة خروج Tor حالياً — بالقائمة الرسمية"
+                         if ip in tor_ips else
+                         "ليس عقدة خروج Tor في القائمة الرسمية الحالية"))
+    else:
+        lines.append("  Tor: تعذّر جلب القائمة الرسمية الآن.")
+    flags = None
+    try:
+        flags = _bot_get_json(
+            f"http://ip-api.com/json/{ip}?fields=status,proxy,hosting,"
+            "mobile")
+    except Exception:
+        flags = None
+    if flags and flags.get("status") == "success":
+        marks = []
+        if flags.get("proxy"):
+            marks.append("🔴 مؤشرات بروكسي/تمويه")
+        if flags.get("hosting"):
+            marks.append("🟠 استضافة/مركز بيانات")
+        if flags.get("mobile"):
+            marks.append("📶 شبكة جوال")
+        if marks:
+            lines.append("  " + "، ".join(marks) +
+                         " (قواعد تصنيف ip-api — مؤشرات لا يقين)")
+        else:
+            lines.append("  لا مؤشرات بروكسي/استضافة/جوال في قواعد "
+                         "ip-api — يبدو اتصالاً سكنياً عادياً")
+    else:
+        lines.append("  تعذّر جلب مؤشرات التصنيف من ip-api الآن.")
+    domains = None
+    try:
+        raw = _bot_get_text(
+            f"https://api.hackertarget.com/reverseiplookup/?q={ip}")
+        found = set()
+        for ln in raw.splitlines():
+            d = ln.strip().lower()
+            if HOST_RE.match(d) and not d.endswith(".arpa"):
+                found.add(d)
+        domains = sorted(found)
+    except Exception:
+        domains = None
+    if domains:
+        lines.append(f"🌐 نطاقات مستضافة على هذا العنوان "
+                     f"(سجلّات عامة): {len(domains)}")
+        for d in domains[:12]:
+            lines.append(f"  • {d}")
+        if len(domains) > 12:
+            lines.append(f"  … و{len(domains) - 12} أخرى")
+    elif domains is not None:
+        lines.append("🌐 لا نطاقات معروفة على هذا العنوان في سجلّات "
+                     "HackerTarget العامة.")
+    bl = _dnsbl_lookup(ip)
+    if bl is None:
+        lines.append("📧 سمعة البريد (DNSBL): القوائم الكبرى تخص "
+                     "عناوين IPv4 فقط.")
+    elif bl:
+        listed = [l for l, s in bl if s == "listed"]
+        clean = [l for l, s in bl if s == "clean"]
+        blocked = [l for l, s in bl if s == "blocked"]
+        if listed:
+            lines.append("📧 سمعة البريد: 🔴 مُدرج في " +
+                         "، ".join(listed))
+        elif clean:
+            lines.append("📧 سمعة البريد: غير مُدرج في " +
+                         "، ".join(clean))
+        else:
+            lines.append("📧 سمعة البريد: تعذّر حسمها الآن.")
+        if blocked:
+            lines.append("  (قوائم رفضت الاستعلام عبر مُحلّل عام: " +
+                         "، ".join(blocked) + " — الرفض ليس إدراجاً)")
+    lines.append("ملاحظة: استخبارات سلبية من سجلّات عامة لحظة الطلب، "
+                 "بلا أي مسح نشط — فحص المنافذ الفعلي يتم من «طلب فحص "
+                 "جديد» وبموافقة الأدمن كالمعتاد.")
+    return "\n".join(lines)
+
+
 def handle_message(msg):
     chat_id = msg["chat"]["id"]
     user = msg.get("from", {})
@@ -1838,6 +2092,15 @@ def handle_message(msg):
         except Exception as exc:
             card = f"❌ تعذّر إكمال التحقق: {exc}"
         send(chat_id, card, MAIN_KB)
+        return
+    if state and state["step"] == "ip_await_address":
+        STATE.pop(chat_id, None)
+        send(chat_id, "🔎 جارٍ البحث العميق في السجلّات العامة…")
+        try:
+            card = ip_deep_lookup(text)
+        except Exception as exc:
+            card = f"❌ تعذّر إكمال البحث: {exc}"
+        send_long(chat_id, card, MAIN_KB)
         return
     if state and state["step"] == "sca_await_file":
         filename, data = None, None
@@ -2139,6 +2402,15 @@ def handle_callback(cb):
                       "Gemfile.lock (Ruby)، composer.lock (PHP).\n"
                       "أو الصق محتوى requirements.txt نصاً مباشرة.\n"
                       "الملف يُحلَّل ولا يُخزَّن.")
+    elif data == "ip_deep":
+        STATE[chat_id] = {"step": "ip_await_address"}
+        send(chat_id, "🔍 البحث العميق في IP: أرسل أي عنوان IP عام "
+                      "(مثال: 8.8.8.8) وسأجلب بطاقته الكاملة من "
+                      "السجلّات العامة: المنظمة وASN وتوجيه BGP، "
+                      "الاسم العكسي، مؤشرات VPN/بروكسي/Tor/استضافة، "
+                      "النطاقات المستضافة عليه، وسمعة البريد.\n"
+                      "بحث سلبي فوري — لا فحص منافذ فيه (ذلك بموافقة "
+                      "الأدمن من «طلب فحص جديد»).")
     elif data == "phone_card":
         STATE[chat_id] = {"step": "phone_await_number"}
         send(chat_id, "📱 بطاقة رقم هاتف: أرسل الرقم بالصيغة الدولية "
