@@ -135,7 +135,7 @@ class VersionCveCheckTests(unittest.TestCase):
 
 
 def router_bytes(routes):
-    def fake(url, timeout=5, cap=262144):
+    def fake(url, timeout=5, cap=262144, headers=None):
         for key, result in routes.items():
             if url.endswith(key):
                 return result
@@ -168,7 +168,7 @@ class HiddenContentTests(unittest.TestCase):
     def test_catch_all_baseline_suppresses(self):
         body = b"ref: refs/heads/main\n"
 
-        def fake(url, timeout=5, cap=262144):
+        def fake(url, timeout=5, cap=262144, headers=None):
             return (200, body)  # every path returns the same body
 
         with mock.patch.object(main, "_http_get_bytes", fake):
