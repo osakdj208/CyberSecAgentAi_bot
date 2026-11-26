@@ -83,7 +83,10 @@ CATALOG_NOTE = (
     "بدرجات CVSS وأول إصدار مُصلِح، وبتصريح مرتبط ببصمة الملف. "
     "وداخل التقييم الشامل أيضاً: كشف استيلاء النطاقات الفرعية، تدقيق "
     "DNS عميق (AXFR/DNSSEC/CAA)، فحص API وGraphQL، تعدين JavaScript، "
-    "وكشف التخزين السحابي المكشوف (S3/GCS/Azure). "
+    "وكشف التخزين السحابي المكشوف (S3/GCS/Azure). ويدعم التقييم الشامل "
+    "بصمة مرور اختيارية (ترويسة تعريف تُرفق بكل طلباته إلى مضيفي الهدف "
+    "— كما تشترط برامج المكافآت)، وينبّه تلقائياً عند اكتشاف Wildcard "
+    "DNS حتى لا تُقرأ أسماء الصدى كخدمات حقيقية. "
     "(11) بحث عميق موحّد في أي عنوان IP (بطاقة فورية): منظمة وASN "
     "وبادئة معلنة وظهور توجيه BGP وأول ظهور مسجل وتوقيع RPKI، اسم "
     "عكسي PTR، تسجيل ملكية RDAP وبريد الإساءة، انكشاف العنوان في "
@@ -422,10 +425,13 @@ def run_approved_full_scan(req):
     ips = resolve_host_ips(req["ip"])
     permit = create_full_permit(req["ip"], ips, req["id"],
                                 int(time.time() * 1000) + PERMIT_TTL_MS)
+    pass_pair = PASS_SECRETS.pop(req["id"], None)  # one-shot, as web/origin
     return engine_call("POST", "/scans/full", body={
         "target_host": req["ip"],
         "authorization_reference": req["auth_ref"],
         "confirm_authorized": True,
+        "pass_header_name": pass_pair[0] if pass_pair else None,
+        "pass_header_value": pass_pair[1] if pass_pair else None,
     }, permit=permit, timeout=1800)
 
 
@@ -775,6 +781,9 @@ def format_full_report(req, result) -> str:
              f"المرجع: {req['auth_ref']}  |  الملف: {result.get('profile','')}"]
     if result.get("elapsed_seconds") is not None:
         lines.append(f"مدة التقييم: {result['elapsed_seconds']} ثانية")
+    if result.get("pass_used"):
+        lines.append("🚪 مرّ الفاحص ببصمة مرور (ترويسة تعريف أُرفقت بكل "
+                     "طلبات التقييم الموجّهة إلى مضيفي الهدف).")
     lines.append(f"\n🏆 درجة الأمان الإجمالية: {score.get('score', '?')}/100 "
                  f"({score.get('grade', '')})")
     deductions = score.get("deductions") or []
@@ -795,6 +804,13 @@ def format_full_report(req, result) -> str:
         lines.append(f"  • {s}")
     if len(subs) > 15:
         lines.append(f"  … و{len(subs) - 15} أخرى")
+    wildcard = discovery.get("wildcard") or {}
+    if wildcard.get("detected"):
+        lines.append("  ⚠️ تنبيه Wildcard DNS: هذا النطاق يردّ على أي اسم "
+                     "مخترع (صدى عند: "
+                     f"{', '.join(wildcard.get('ips') or [])}) — بعض الأسماء "
+                     "المكتشفة بالتخمين قد تكون صدى تلقائياً لا خدمات "
+                     "حقيقية؛ الاعتماد على المضيفين المقيّمين فعلياً أدناه.")
     email = result.get("email") or {}
     if email.get("status") == "ready":
         lines.append("\n📧 أمان البريد:")
@@ -2254,8 +2270,13 @@ def handle_message(msg):
             proof_text = msg.get("caption") or "صورة إثبات مرفقة"
         elif text and text not in ("تخطي", "skip"):
             proof_text = text[:1000]
-        state.update(proof_file_id=proof_file_id, proof_text=proof_text)
-        create_full_request(chat_id, user, state)
+        state.update(step="f_await_pass", proof_file_id=proof_file_id,
+                     proof_text=proof_text)
+        send(chat_id, PASS_PROMPT)
+        return
+    if state and state["step"] == "f_await_pass":
+        create_full_request(chat_id, user, state,
+                            pass_pair=parse_pass_pair(text))
         return
     if state and state["step"] == "u_await_host":
         try:
@@ -2469,7 +2490,7 @@ def create_origin_request(chat_id, user, state, deep, cookie=None, pass_pair=Non
     notify_admin(req)
 
 
-def create_full_request(chat_id, user, state):
+def create_full_request(chat_id, user, state, pass_pair=None):
     req = {
         "id": uuid.uuid4().hex, "user_id": user.get("id"),
         "username": user.get("username") or user.get("first_name", "?"),
@@ -2482,6 +2503,8 @@ def create_full_request(chat_id, user, state):
         "expires_at": time.time() + APPROVAL_TTL_HOURS * 3600,
     }
     save_request(req)
+    if pass_pair:
+        PASS_SECRETS[req["id"]] = pass_pair
     STATE.pop(chat_id, None)
     send(chat_id, f"⏳ تم إنشاء طلب التقييم الشامل {req['id'][:8]} للمنظومة {req['ip']}.\n"
                   "يشمل: اكتشاف النطاقات الفرعية + منافذ الخوادم + تقييم ويب "
