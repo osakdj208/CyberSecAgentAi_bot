@@ -84,12 +84,15 @@ CATALOG_NOTE = (
     "وداخل التقييم الشامل أيضاً: كشف استيلاء النطاقات الفرعية، تدقيق "
     "DNS عميق (AXFR/DNSSEC/CAA)، فحص API وGraphQL، تعدين JavaScript، "
     "وكشف التخزين السحابي المكشوف (S3/GCS/Azure). "
-    "(11) بحث عميق في أي عنوان IP (بطاقة فورية): منظمة وASN وبادئة "
-    "معلنة وظهور توجيه BGP وأول ظهور مسجل، اسم عكسي PTR، مؤشرات "
-    "تصنيف (Tor من القائمة الرسمية، بروكسي/استضافة/جوال من قواعد "
-    "ip-api)، نطاقات مستضافة على العنوان من سجلّات عامة، وسمعة بريد "
-    "عبر قوائم DNSBL — استخبارات سلبية من سجلّات عامة فقط، بلا أي "
-    "فحص منافذ (الفحص النشط يبقى بموافقة الأدمن). "
+    "(11) بحث عميق موحّد في أي عنوان IP (بطاقة فورية): منظمة وASN "
+    "وبادئة معلنة وظهور توجيه BGP وأول ظهور مسجل وتوقيع RPKI، اسم "
+    "عكسي PTR، تسجيل ملكية RDAP وبريد الإساءة، انكشاف العنوان في "
+    "فهرس Shodan (منافذ وخدمات بإصداراتها وثغرات مرتبطة بها)، فحص "
+    "قوائم تهديد عامة (Feodo C2 وSSLBL وblocklist.de وSpamhaus "
+    "DROP)، مؤشرات تصنيف (Tor من القائمة الرسمية، بروكسي/استضافة/"
+    "جوال من ip-api، وGreyNoise)، نطاقات مستضافة على العنوان، "
+    "وسمعة بريد DNSBL — استخبارات سلبية من سجلّات عامة فقط، بلا أي "
+    "فحص نشط (الفحص المباشر يبقى بموافقة الأدمن). "
     "بقية أدوات الكتالوج في المشروع الأصلي "
     "(ZAP الكامل، Trivy، YARA وغيرها) ما زالت «مخططاً لها» ولم تُبنَ بعد — "
     "هذا البوت يعرض الجاهز فقط بصدق."
@@ -1637,6 +1640,177 @@ def _dnsbl_lookup(ip):
     return out
 
 
+_LIST_CACHES = {}
+
+
+def _list_cached(name, builder):
+    """Hourly in-memory cache for public abuse lists; a failed refresh
+    falls back to the last good copy, never to invented data."""
+    now = time.time()
+    entry = _LIST_CACHES.get(name)
+    if entry and now - entry["at"] <= 3600:
+        return entry["data"]
+    try:
+        data = builder()
+    except Exception:
+        data = None
+    if data is not None:
+        _LIST_CACHES[name] = {"at": now, "data": data}
+        return data
+    return entry["data"] if entry else None
+
+
+def _plain_ip_set(url, skip_prefixes=("#", ";")):
+    text = _bot_get_text(url, timeout=20, cap=4194304)
+    out = set()
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(skip_prefixes):
+            continue
+        try:
+            out.add(str(ipaddress.ip_address(ln)))
+        except ValueError:
+            continue
+    return out
+
+
+def _build_feodo():
+    return _plain_ip_set(
+        "https://feodotracker.abuse.ch/downloads/ipblocklist.txt")
+
+
+def _build_blocklistde():
+    return _plain_ip_set("https://lists.blocklist.de/lists/all.txt")
+
+
+def _build_sslbl():
+    text = _bot_get_text(
+        "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv",
+        timeout=20, cap=1048576)
+    out = set()
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        parts = ln.split(",")
+        if len(parts) > 1:
+            try:
+                out.add(str(ipaddress.ip_address(parts[1].strip())))
+            except ValueError:
+                continue
+    return out
+
+
+def _build_drop():
+    text = _bot_get_text("https://www.spamhaus.org/drop/drop.txt",
+                         timeout=20, cap=1048576)
+    nets = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(";"):
+            continue
+        token = ln.split(";")[0].strip()
+        try:
+            nets.append(ipaddress.ip_network(token))
+        except ValueError:
+            continue
+    return nets
+
+
+def threat_list_hits(ip):
+    """Passive matching against public abuse lists. Returns
+    (hits, checked_names). A hit is a serious, sourced signal;
+    absence is reported only for lists actually fetched (an empty
+    list still counts as fetched)."""
+    hits, checked = [], []
+    addr = ipaddress.ip_address(ip)
+    feodo = _list_cached("feodo", _build_feodo)
+    if feodo is not None:
+        checked.append("Feodo C2")
+        if ip in feodo:
+            hits.append("Feodo Tracker — خوادم تحكّم بوتنت C2 (abuse.ch)")
+    sslbl = _list_cached("sslbl", _build_sslbl)
+    if sslbl is not None:
+        checked.append("SSLBL")
+        if ip in sslbl:
+            hits.append("SSLBL — شهادات SSL لخوادم بوتنت C2 (abuse.ch)")
+    blocklist = _list_cached("blocklistde", _build_blocklistde)
+    if blocklist is not None:
+        checked.append("blocklist.de")
+        if ip in blocklist:
+            hits.append("blocklist.de — عنوان رُصد يهاجم خدمات "
+                        "(SSH/بريد/ويب) خلال 48 ساعة")
+    drop = _list_cached("drop", _build_drop)
+    if drop is not None:
+        checked.append("Spamhaus DROP")
+        if any(addr in net for net in drop):
+            hits.append("Spamhaus DROP — كتلة مخطوفة أو مؤجّرة لنشاط "
+                        "إجرامي موثّق")
+    return hits, checked
+
+
+def _shodan_internetdb(ip):
+    try:
+        d = _bot_get_json(f"https://internetdb.shodan.io/{ip}")
+        return d if isinstance(d, dict) and d.get("ports") is not None \
+            else None
+    except Exception:
+        return None
+
+
+def _rdap_info(ip):
+    try:
+        d = _bot_get_json(f"https://rdap.org/ip/{ip}", timeout=15)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    info = {}
+    if d.get("name"):
+        info["name"] = d["name"]
+    for ev in d.get("events") or []:
+        if ev.get("eventAction") == "registration" and ev.get("eventDate"):
+            info["registered"] = str(ev["eventDate"])[:10]
+
+    def walk(entities):
+        for e in entities or []:
+            email = None
+            vcard = e.get("vcardArray") or []
+            if len(vcard) > 1 and isinstance(vcard[1], list):
+                for item in vcard[1]:
+                    if item and item[0] == "email" and len(item) > 3:
+                        email = item[3]
+            if email and "abuse" in (e.get("roles") or []):
+                return email
+            found = walk(e.get("entities"))
+            if found:
+                return found
+        return None
+
+    abuse = walk(d.get("entities"))
+    if abuse:
+        info["abuse"] = abuse
+    return info or None
+
+
+def _rpki_status(asn, prefix):
+    try:
+        d = _bot_get_json(
+            "https://stat.ripe.net/data/rpki-validation/data.json"
+            f"?resource=AS{asn}&prefix={prefix}", timeout=20)
+        return ((d or {}).get("data") or {}).get("status")
+    except Exception:
+        return None
+
+
+def _greynoise(ip):
+    try:
+        d = _bot_get_json(f"https://api.greynoise.io/v3/community/{ip}")
+        return d if isinstance(d, dict) and d.get("ip") else None
+    except Exception:
+        return None
+
+
 def ip_deep_lookup(text):
     """Deep passive card for any public IP: identity/ASN/BGP routing
     (RIPEstat), geolocation/ISP (ipwho.is), reverse DNS, classification
@@ -1671,12 +1845,14 @@ def ip_deep_lookup(text):
         if basics.get("type"):
             lines.append(f"نوع العنوان: {basics['type']}")
     asn = None
+    prefix = None
     try:
         ni = (_bot_get_json(
             "https://stat.ripe.net/data/network-info/data.json"
             f"?resource={ip}") or {}).get("data") or {}
-        if ni.get("prefix"):
-            lines.append(f"بادئة الشبكة المعلنة: {ni['prefix']}")
+        prefix = ni.get("prefix")
+        if prefix:
+            lines.append(f"بادئة الشبكة المعلنة: {prefix}")
         asns = ni.get("asns") or []
         asn = asns[0] if asns else None
     except Exception:
@@ -1718,6 +1894,74 @@ def ip_deep_lookup(text):
                              f"{str(first_seen)[:10]}")
         except Exception:
             pass
+        if prefix:
+            rpki = _rpki_status(asn, prefix)
+            rpki_lines = {
+                "valid": "🔐 توقيع التوجيه RPKI: صالح — إعلان هذه "
+                         "البادئة من هذا النظام مصرّح تشفيرياً",
+                "notfound": "🔐 توقيع التوجيه RPKI: لا شهادة مسجلة "
+                            "لهذه البادئة (شائع، ليس خطراً بحد ذاته)",
+                "invalid_asn": "🔐 توقيع التوجيه RPKI: 🔴 غير صالح — "
+                               "النظام المعلن غير مصرّح له بهذه البادئة!",
+                "invalid_length": "🔐 توقيع التوجيه RPKI: 🔴 غير صالح "
+                                  "— طول البادئة المعلنة يتجاوز المصرّح",
+            }
+            if rpki in rpki_lines:
+                lines.append(rpki_lines[rpki])
+    rdap = _rdap_info(ip)
+    if rdap:
+        if rdap.get("name"):
+            lines.append(f"📜 اسم الشبكة المسجل (RDAP): {rdap['name']}")
+        if rdap.get("registered"):
+            lines.append(f"تاريخ تسجيل الشبكة: {rdap['registered']}")
+        if rdap.get("abuse"):
+            lines.append(f"بريد الإبلاغ عن الإساءة: {rdap['abuse']}")
+    shodan = _shodan_internetdb(ip)
+    if shodan:
+        lines.append("👁️ ما يكشفه العنوان عن نفسه "
+                     "(فهرس Shodan — من مسوحاته الدورية):")
+        ports = shodan.get("ports") or []
+        if ports:
+            lines.append("  منافذ مرصودة مفتوحة: " +
+                         "، ".join(str(p) for p in ports[:20]))
+        cpes = shodan.get("cpes") or []
+        products = []
+        for cpe in cpes:
+            parts = str(cpe).strip("/").split(":")
+            if len(parts) >= 4 and parts[1].strip("/") in ("a", "o", "h"):
+                label = (parts[2] + " " + parts[3]).replace("_", " ")
+                if len(parts) >= 5 and parts[4]:
+                    label += " " + parts[4]
+                products.append(label)
+        if products:
+            lines.append("  خدمات/أنظمة مرصودة بإصداراتها: " +
+                         "، ".join(products[:8]))
+        hostnames = shodan.get("hostnames") or []
+        if hostnames:
+            lines.append("  أسماء مضيف معروفة: " +
+                         "، ".join(hostnames[:6]))
+        tags = shodan.get("tags") or []
+        if tags:
+            lines.append("  وسوم Shodan: " + "، ".join(tags[:6]))
+        vulns = shodan.get("vulns") or []
+        if vulns:
+            lines.append(f"🔓 ثغرات مرتبطة بهذا العنوان في فهرس "
+                         f"Shodan: {len(vulns)}")
+            lines.append("  " + "، ".join(vulns[:10]))
+            lines.append("  (مطابقة Shodan الآلية من إصدارات الخدمات "
+                         "المرصودة — تحتاج تأكيداً بفحص فعلي قبل الجزم)")
+        elif ports:
+            lines.append("🔓 لا ثغرات مرتبطة بالعنوان في فهرس Shodan "
+                         "حالياً.")
+    hits, checked = threat_list_hits(ip)
+    if checked:
+        lines.append("🛡️ قوائم التهديد العامة:")
+        if hits:
+            for h in hits:
+                lines.append(f"  🔴 مُدرج في: {h}")
+        else:
+            lines.append("  غير موجود في القوائم المفحوصة: " +
+                         "، ".join(checked))
     lines.append("🧭 تصنيف الاتصال:")
     tor_ips = _tor_exit_set()
     if tor_ips:
@@ -1750,6 +1994,19 @@ def ip_deep_lookup(text):
                          "ip-api — يبدو اتصالاً سكنياً عادياً")
     else:
         lines.append("  تعذّر جلب مؤشرات التصنيف من ip-api الآن.")
+    grey = _greynoise(ip)
+    if grey:
+        cls = {"benign": "حميد", "malicious": "خبيث",
+               "unknown": "غير محسوم"}.get(grey.get("classification"),
+                                           grey.get("classification"))
+        bits = [f"تصنيف GreyNoise: {cls}"]
+        if grey.get("riot"):
+            bits.append("خدمة معروفة موثوقة (RIOT)")
+        if grey.get("noise"):
+            bits.append("🔴 يُرصد يمسح الإنترنت جماعياً (Noise)")
+        if grey.get("name"):
+            bits.append(str(grey["name"]))
+        lines.append("  " + " — ".join(bits))
     domains = None
     try:
         raw = _bot_get_text(
@@ -1791,9 +2048,10 @@ def ip_deep_lookup(text):
         if blocked:
             lines.append("  (قوائم رفضت الاستعلام عبر مُحلّل عام: " +
                          "، ".join(blocked) + " — الرفض ليس إدراجاً)")
-    lines.append("ملاحظة: استخبارات سلبية من سجلّات عامة لحظة الطلب، "
-                 "بلا أي مسح نشط — فحص المنافذ الفعلي يتم من «طلب فحص "
-                 "جديد» وبموافقة الأدمن كالمعتاد.")
+    lines.append("ملاحظة: استخبارات سلبية من سجلّات عامة وفهارس مسح "
+                 "عامة لحظة الطلب، بلا أي مسح نشط منّا — فحص المنافذ "
+                 "والثغرات الفعلي المباشر يتم من «طلب فحص جديد» "
+                 "وبموافقة الأدمن كالمعتاد.")
     return "\n".join(lines)
 
 
@@ -2404,13 +2662,15 @@ def handle_callback(cb):
                       "الملف يُحلَّل ولا يُخزَّن.")
     elif data == "ip_deep":
         STATE[chat_id] = {"step": "ip_await_address"}
-        send(chat_id, "🔍 البحث العميق في IP: أرسل أي عنوان IP عام "
-                      "(مثال: 8.8.8.8) وسأجلب بطاقته الكاملة من "
-                      "السجلّات العامة: المنظمة وASN وتوجيه BGP، "
-                      "الاسم العكسي، مؤشرات VPN/بروكسي/Tor/استضافة، "
-                      "النطاقات المستضافة عليه، وسمعة البريد.\n"
-                      "بحث سلبي فوري — لا فحص منافذ فيه (ذلك بموافقة "
-                      "الأدمن من «طلب فحص جديد»).")
+        send(chat_id, "🔍 البحث العميق الموحّد في IP: أرسل أي عنوان "
+                      "IP عام (مثال: 8.8.8.8) وسأجلب بطاقته الكاملة: "
+                      "المنظمة وASN وتوجيه BGP وتوقيع RPKI، تسجيل "
+                      "الملكية، انكشافه في فهرس Shodan (منافذ وخدمات "
+                      "وثغرات مرتبطة)، قوائم التهديد العامة، مؤشرات "
+                      "VPN/بروكسي/Tor، النطاقات المستضافة عليه، "
+                      "وسمعة البريد.\nبحث سلبي فوري من سجلّات عامة — "
+                      "الفحص النشط المباشر بموافقة الأدمن من «طلب "
+                      "فحص جديد».")
     elif data == "phone_card":
         STATE[chat_id] = {"step": "phone_await_number"}
         send(chat_id, "📱 بطاقة رقم هاتف: أرسل الرقم بالصيغة الدولية "
