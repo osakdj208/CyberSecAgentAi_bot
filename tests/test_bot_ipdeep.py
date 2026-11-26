@@ -25,11 +25,27 @@ JSON_ROUTES = {
         "first_seen": {"time": "2009-01-01T00:00:00"}}},
     "ip-api.com": {"status": "success", "proxy": False, "hosting": True,
                    "mobile": False},
+    "internetdb.shodan.io": {
+        "ports": [22, 80, 443], "hostnames": ["scanme.nmap.org"],
+        "cpes": ["cpe:/a:apache:http_server:2.4.7",
+                 "cpe:/o:canonical:ubuntu_linux"],
+        "tags": ["cloud"], "vulns": ["CVE-2017-3167", "CVE-2017-7679"]},
+    "rdap.org": {"name": "GOOGLE LLC",
+                 "events": [{"eventAction": "registration",
+                             "eventDate": "2000-03-30T00:00:00Z"}],
+                 "entities": [{"roles": ["abuse"], "vcardArray": [
+                     "vcard", [["email", {}, "text",
+                                "abuse@google.com"]]]}]},
+    "rpki-validation": {"data": {"status": "valid"}},
 }
 TEXT_ROUTES = {
     "torbulkexitlist": "1.2.3.4\n8.8.8.8\n",
     "reverseiplookup": "dns.google\nexample.com\n"
                        "0.0.8.8.in-addr.arpa\nnot a domain\n",
+    "feodotracker": "# comment\n5.5.5.5\n",
+    "sslipblacklist": "# comment\n2025-01-01,6.6.6.6,443\n",
+    "drop.txt": "; header\n7.7.7.0/24 ; SBL123\n",
+    "lists.blocklist.de": "9.9.9.9\n8.8.4.4\n",
 }
 
 
@@ -48,6 +64,7 @@ def fake_text(url, timeout=12, cap=524288):
 
 
 def run_lookup(ip, dnsbl):
+    bot._LIST_CACHES.clear()
     with mock.patch.object(bot, "_bot_get_json", fake_json), \
          mock.patch.object(bot, "_bot_get_text", fake_text), \
          mock.patch.object(bot, "_ptr_lookup",
@@ -74,6 +91,16 @@ class IpDeepCardTests(unittest.TestCase):
         self.assertIn("2009-01-01", card)
         self.assertIn("ليس عقدة خروج Tor", card)
         self.assertIn("استضافة/مركز بيانات", card)
+        self.assertIn("توقيع التوجيه RPKI: صالح", card)
+        self.assertIn("GOOGLE LLC", card)
+        self.assertIn("abuse@google.com", card)
+        self.assertIn("ما يكشفه العنوان عن نفسه", card)
+        self.assertIn("منافذ مرصودة مفتوحة: 22، 80، 443", card)
+        self.assertIn("apache http server 2.4.7", card)
+        self.assertIn("ثغرات مرتبطة بهذا العنوان", card)
+        self.assertIn("CVE-2017-3167", card)
+        self.assertIn("غير موجود في القوائم المفحوصة", card)
+        self.assertIn("Feodo C2", card)
         self.assertIn("نطاقات مستضافة", card)
         self.assertIn("example.com", card)
         self.assertNotIn("in-addr.arpa", card)
@@ -87,6 +114,24 @@ class IpDeepCardTests(unittest.TestCase):
         self.assertIn("عقدة خروج Tor حالياً", card)
         self.assertIn("مُدرج في Spamhaus ZEN", card)
         self.assertIn("الرفض ليس إدراجاً", card)
+
+    def test_threat_hits(self):
+        # 5.5.5.5 is in the fake Feodo list; 7.7.7.9 is inside the
+        # fake DROP range; 9.9.9.9 is in the fake blocklist.de list.
+        hits, checked = self._hits("5.5.5.5")
+        self.assertEqual(len(checked), 4)
+        self.assertTrue(any("Feodo" in h for h in hits))
+        hits, _ = self._hits("7.7.7.9")
+        self.assertTrue(any("DROP" in h for h in hits))
+        hits, _ = self._hits("9.9.9.9")
+        self.assertTrue(any("blocklist.de" in h for h in hits))
+        hits, _ = self._hits("8.8.8.8")
+        self.assertEqual(hits, [])
+
+    def _hits(self, ip):
+        bot._LIST_CACHES.clear()
+        with mock.patch.object(bot, "_bot_get_text", fake_text):
+            return bot.threat_list_hits(ip)
 
     def test_private_ip_rejected(self):
         card = bot.ip_deep_lookup("192.168.1.1")
