@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.13.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.14.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"},{"name":"API surface & GraphQL introspection check","state":"ready"},{"name":"JavaScript mining (exposed secrets, API endpoints, internal addresses)","state":"ready"},{"name":"Cloud storage exposure check (S3 / Azure Blob / GCS)","state":"ready"},{"name":"Dependency vulnerability analysis (SCA via OSV.dev)","state":"ready"},{"name":"Version-to-CVE matching (NVD, strict applicability filter)","state":"ready"},{"name":"Sensitive content exposure (signature-verified paths)","state":"ready"},{"name":"Expanded passive subdomain sources (crt.sh, HackerTarget, urlscan, Wayback)","state":"ready"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed pass fingerprint (CDN pass / researcher identification header; web, origin & full assessment)","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"},{"name":"API surface & GraphQL introspection check","state":"ready"},{"name":"JavaScript mining (exposed secrets, API endpoints, internal addresses)","state":"ready"},{"name":"Cloud storage exposure check (S3 / Azure Blob / GCS)","state":"ready"},{"name":"Dependency vulnerability analysis (SCA via OSV.dev)","state":"ready"},{"name":"Version-to-CVE matching (NVD, strict applicability filter)","state":"ready"},{"name":"Sensitive content exposure (signature-verified paths)","state":"ready"},{"name":"Expanded passive subdomain sources (crt.sh, HackerTarget, urlscan, Wayback)","state":"ready"},{"name":"Wildcard DNS detection (echo warning in full assessment)","state":"ready"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -787,6 +787,8 @@ class FullScanRequest(BaseModel):
     target_host: str
     authorization_reference: str = Field(min_length=4, max_length=120)
     confirm_authorized: bool
+    pass_header_name: Optional[str] = Field(default=None, max_length=60)
+    pass_header_value: Optional[str] = Field(default=None, max_length=256)
 
 def valid_full_permit(value: Optional[str], host: str, ips) -> bool:
     if not value or not PERMIT_SECRET: return False
@@ -910,6 +912,15 @@ def _txt_records(resolver, name):
     except Exception:
         return []
 
+def detect_wildcard_dns(base):
+    """Wildcard-DNS probe: resolve one random, certainly-nonexistent
+    name. If it resolves, the zone answers for ANY name, so names found
+    by wordlist guessing may be wildcard echoes rather than real
+    services. Returns the wildcard address set (empty when no
+    wildcard). Reporting aid only — never changes what is assessed."""
+    probe = f"probe-{secrets.token_hex(4)}.{base}"
+    return _resolve_quiet(probe)
+
 def email_security(domain: str):
     """SPF / DMARC / DKIM-selector audit from public DNS only."""
     if dns is None:
@@ -1020,10 +1031,11 @@ def _cname_chain(resolver, name, depth=5):
         current = target
     return chain
 
-def _fetch_text(url, timeout=5, cap=65536):
+def _fetch_text(url, timeout=5, cap=65536, headers=None):
     try:
         req = urllib.request.Request(
-            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0",
+                          **(headers or {})})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read(cap).decode("utf-8", "ignore")
     except urllib.error.HTTPError as exc:
@@ -1041,7 +1053,7 @@ def _takeover_match(chain):
                 return target, service, markers
     return None, None, []
 
-def subdomain_takeover_check(hosts):
+def subdomain_takeover_check(hosts, headers=None):
     """Dangling-CNAME / subdomain-takeover detection over the already
     discovered names. Detection only: at most one bounded HTTP fetch per
     candidate, and every verdict is labelled by its evidence strength."""
@@ -1060,7 +1072,7 @@ def subdomain_takeover_check(hosts):
             continue
         evidence = None
         for scheme in ("https", "http"):
-            body = _fetch_text(f"{scheme}://{host}/")
+            body = _fetch_text(f"{scheme}://{host}/", headers=headers)
             if body:
                 evidence = next((m for m in markers if m in body), None)
                 break
@@ -1122,13 +1134,14 @@ def dns_deep_audit(domain):
             "caa": {"present": bool(caa), "records": caa[:5]}}
 
 # --------------------- Phase C2: API surface / GraphQL + JavaScript mining
-def _http_get(url, timeout=5, cap=262144):
+def _http_get(url, timeout=5, cap=262144, headers=None):
     """(status, text) for one bounded GET; (None, "") on transport
     failure. HTTP error statuses still return their body — detectors
     need it."""
     try:
         req = urllib.request.Request(
-            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0",
+                          **(headers or {})})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read(cap).decode("utf-8", "ignore")
     except urllib.error.HTTPError as exc:
@@ -1139,12 +1152,13 @@ def _http_get(url, timeout=5, cap=262144):
     except Exception:
         return None, ""
 
-def _http_post_json(url, payload, timeout=5, cap=65536):
+def _http_post_json(url, payload, timeout=5, cap=65536, headers=None):
     try:
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode(), method="POST",
             headers={"User-Agent": "CyberSecurityAI-Agent/1.0",
-                     "Content-Type": "application/json"})
+                     "Content-Type": "application/json",
+                     **(headers or {})})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read(cap).decode("utf-8", "ignore")
     except urllib.error.HTTPError as exc:
@@ -1161,7 +1175,7 @@ API_DOC_PAGES = ["/swagger-ui.html", "/swagger-ui/", "/redoc"]
 GRAPHQL_PATHS = ["/graphql", "/api/graphql"]
 _INTROSPECTION_QUERY = {"query": "{__schema{queryType{name}}}"}
 
-def api_surface_check(host, scheme):
+def api_surface_check(host, scheme, headers=None):
     """Public API documentation exposure + GraphQL introspection state.
     Detection only: reads public schema documents and asks a GraphQL
     endpoint the minimal schema question; never calls business
@@ -1169,7 +1183,7 @@ def api_surface_check(host, scheme):
     base = f"{scheme}://{host}"
     out = {"status": "ready", "openapi": [], "doc_pages": [], "graphql": []}
     for path in OPENAPI_PATHS:
-        status, text = _http_get(base + path, cap=1048576)
+        status, text = _http_get(base + path, cap=1048576, headers=headers)
         if status != 200 or not text:
             continue
         try:
@@ -1184,12 +1198,13 @@ def api_surface_check(host, scheme):
                 "version": str(info.get("version", ""))[:20],
                 "endpoints": len(doc.get("paths") or {})})
     for path in API_DOC_PAGES:
-        status, text = _http_get(base + path, cap=65536)
+        status, text = _http_get(base + path, cap=65536, headers=headers)
         lowered = (text or "").lower()
         if status == 200 and ("swagger" in lowered or "redoc" in lowered):
             out["doc_pages"].append(path)
     for path in GRAPHQL_PATHS:
-        status, text = _http_post_json(base + path, _INTROSPECTION_QUERY)
+        status, text = _http_post_json(base + path, _INTROSPECTION_QUERY,
+                                       headers=headers)
         if status is None or not text:
             continue
         try:
@@ -1214,13 +1229,13 @@ _PRIVATE_IP_RE = re.compile(
     r"|192\.168\.\d{1,3}\.\d{1,3}"
     r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")
 
-def js_mining(host, scheme):
+def js_mining(host, scheme, headers=None):
     """Mine the site's own public JavaScript for exposed secret
     patterns, API endpoint paths and internal addresses. Same-host
     scripts only, bounded in count and size; secrets are reported by
     6-character prefix only (the shared APK secret scanner)."""
     base = f"{scheme}://{host}"
-    status, html = _http_get(base + "/", cap=524288)
+    status, html = _http_get(base + "/", cap=524288, headers=headers)
     if status is None or not html:
         return {"status": "unavailable"}
     srcs = []
@@ -1234,7 +1249,7 @@ def js_mining(host, scheme):
            "external_domains": []}
     endpoints, internal, domains = set(), set(), set()
     for url in srcs[:8]:
-        s2, text = _http_get(url, cap=1572864)
+        s2, text = _http_get(url, cap=1572864, headers=headers)
         if s2 is None or not text:
             continue
         out["files_checked"] += 1
@@ -1851,10 +1866,11 @@ def version_cve_check(pairs):
                 f"{pair['display']} {pair['version']}")
     return out
 
-def _http_get_bytes(url, timeout=5, cap=262144):
+def _http_get_bytes(url, timeout=5, cap=262144, headers=None):
     try:
         req = urllib.request.Request(
-            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0",
+                          **(headers or {})})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read(cap)
     except urllib.error.HTTPError as exc:
@@ -1911,19 +1927,20 @@ SENSITIVE_PATHS = [
     ("/server-status", "status"),
 ]
 
-def hidden_content_check(host, scheme):
+def hidden_content_check(host, scheme, headers=None):
     """Sensitive-path exposure, proven by content signature. A random
     nonexistent path is fetched first: a candidate whose body equals
     the baseline (catch-all sites) is never reported."""
     base = f"{scheme}://{host}"
     token = secrets.token_hex(4)
     bstatus, bbody = _http_get_bytes(
-        base + f"/probe-{token}-nonexistent", timeout=5, cap=65536)
+        base + f"/probe-{token}-nonexistent", timeout=5, cap=65536,
+        headers=headers)
     baseline = hashlib.sha256(bbody).hexdigest() if bbody else None
     findings = []
     for path, kind in SENSITIVE_PATHS:
         status, body = _http_get_bytes(base + path, timeout=5,
-                                       cap=262144)
+                                       cap=262144, headers=headers)
         if status != 200 or not body:
             continue
         if baseline and hashlib.sha256(body).hexdigest() == baseline:
@@ -2117,10 +2134,13 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
     require_auth(authorization)
     if not request.confirm_authorized: raise HTTPException(status_code=400, detail="Explicit authorization confirmation is required.")
     host, ips = check_full_target(request.target_host, x_scan_approval)
+    pass_headers = _pass_headers(request)
+    pass_list = [f"{k}: {v}" for k, v in pass_headers.items()]
     started = time.time()
     base = host[4:] if host.startswith("www.") else host
 
     discovered = discover_subdomains(base)
+    wildcard_ips = detect_wildcard_dns(base)
     candidates = []
     for name in [host, base] + discovered:
         if name not in candidates:
@@ -2133,7 +2153,7 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
         for ip in resolved:
             if ip not in all_ips:
                 all_ips.append(ip)
-        http = http_probe(name)
+        http = http_probe(name, extra_headers=pass_headers or None)
         tls = tls_probe(name) if http.get("status") == "ready" else {"status": "skipped"}
         assessed.append({"host": name, "ips": resolved, "http": http,
                          "tls": tls, "tech": tech_fingerprint(http),
@@ -2150,13 +2170,17 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             entry["js"] = {"status": "skipped_budget"}
             entry["hidden"] = {"status": "skipped_budget"}
             continue
-        entry["nuclei"] = nuclei_scan(entry["host"], deep=False)
+        entry["nuclei"] = nuclei_scan(entry["host"], deep=False,
+                                      headers=pass_list or None)
         nuclei_done += 1
         if time.time() - started <= 1150:
             scheme = (entry.get("http") or {}).get("scheme") or "https"
-            entry["api"] = api_surface_check(entry["host"], scheme)
-            entry["js"] = js_mining(entry["host"], scheme)
-            entry["hidden"] = hidden_content_check(entry["host"], scheme)
+            entry["api"] = api_surface_check(entry["host"], scheme,
+                                             headers=pass_headers or None)
+            entry["js"] = js_mining(entry["host"], scheme,
+                                    headers=pass_headers or None)
+            entry["hidden"] = hidden_content_check(
+                entry["host"], scheme, headers=pass_headers or None)
         else:
             entry["api"] = {"status": "skipped_budget"}
             entry["js"] = {"status": "skipped_budget"}
@@ -2174,7 +2198,8 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
                                 "error": exc.detail})
     email = email_security(base)
     dns_audit = dns_deep_audit(base)
-    takeover = subdomain_takeover_check(candidates)
+    takeover = subdomain_takeover_check(candidates,
+                                        headers=pass_headers or None)
     cloud = cloud_storage_check(base) if time.time() - started <= 1250 \
         else {"status": "skipped_budget"}
     pairs = collect_version_pairs(assessed, ports_by_ip)
@@ -2192,9 +2217,12 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             "resolved_ips": ips,
             "authorization_reference": request.authorization_reference,
             "profile": "approved-full-assessment-v1",
+            "pass_used": bool(pass_headers),
             "elapsed_seconds": int(time.time() - started),
             "discovery": {"subdomains_found": discovered,
-                          "hosts_assessed": [h["host"] for h in assessed]},
+                          "hosts_assessed": [h["host"] for h in assessed],
+                          "wildcard": {"detected": bool(wildcard_ips),
+                                       "ips": wildcard_ips}},
             "dns": dns_records(host),
             "hosts": assessed, "ports_by_ip": ports_by_ip,
             "email": email, "dns_audit": dns_audit, "takeover": takeover,
@@ -2208,7 +2236,9 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
                             "API/GraphQL checks read public schema documents and ask a GraphQL endpoint only its minimal schema question; JavaScript mining covers same-host scripts only (up to 8 files per host), and secrets are shown by short prefix only.",
                             "Cloud storage checks probe bucket names derived from the domain on S3, GCS and Azure Blob; a bucket counts as exposed only when an anonymous listing actually succeeds.",
                             "Version-to-CVE matching uses NVD with a strict applicability filter (vulnerable flag + exact product + exact version or covering range). It matches the ADVERTISED version: Linux distributions may backport a fix without changing the version string, so confirm against the distribution's changelog before treating a match as final.",
-                            "Sensitive-content findings are proven by content signature and cross-checked against a random-path baseline, so catch-all sites do not produce them."]}
+                            "Sensitive-content findings are proven by content signature and cross-checked against a random-path baseline, so catch-all sites do not produce them.",
+                            "When a pass fingerprint (identification header) is supplied, it is attached to every request this assessment sends to the target's own hosts (HTTP probes, Nuclei, API/GraphQL, JavaScript, hidden-content and takeover fetches); DNS, TLS and third-party lookups cannot carry it.",
+                            "Wildcard DNS is probed with one random nonexistent name; when the zone answers for any name, wordlist-discovered names may be wildcard echoes, and the report says so."]}
 
 # ------------------------------------------------- Android APK static analysis
 import io, zipfile
