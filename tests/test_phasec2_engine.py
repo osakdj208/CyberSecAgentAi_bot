@@ -14,7 +14,7 @@ OPENAPI_DOC = json.dumps({
 
 
 def router_get(routes):
-    def fake(url, timeout=5, cap=262144):
+    def fake(url, timeout=5, cap=262144, headers=None):
         for suffix, result in routes.items():
             if url.endswith(suffix):
                 return result
@@ -23,7 +23,7 @@ def router_get(routes):
 
 
 def router_post(routes):
-    def fake(url, payload, timeout=5, cap=65536):
+    def fake(url, payload, timeout=5, cap=65536, headers=None):
         for suffix, result in routes.items():
             if url.endswith(suffix):
                 return result
