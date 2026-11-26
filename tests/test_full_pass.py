@@ -46,7 +46,7 @@ def _stages(captured):
         captured["hidden"] = headers
         return {"status": "ready", "findings": [], "catch_all": False}
 
-    def takeover(hosts, headers=None):
+    def takeover(hosts, headers=None, deadline_ts=None):
         captured["takeover"] = headers
         return {"status": "ready", "checked": 0, "findings": []}
 
