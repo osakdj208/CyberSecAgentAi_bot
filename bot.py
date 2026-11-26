@@ -745,6 +745,20 @@ def format_web_report(req, result, origin_ip=None) -> str:
     return "\n".join(lines)
 
 
+HIDDEN_KIND_AR = {
+    "git_head": "مستودع Git مكشوف (رأس المستودع)",
+    "git_config": "مستودع Git مكشوف (إعداداته)",
+    "env": "ملف بيئة (.env) بأسرار مكشوفة",
+    "archive": "أرشيف نسخة احتياطية مكشوف",
+    "sql": "تفريغ قاعدة بيانات مكشوف",
+    "config": "نسخة احتياطية من ملف إعدادات مكشوفة",
+    "svn": "بيانات مستودع SVN مكشوفة",
+    "hg": "بيانات مستودع Mercurial مكشوفة",
+    "status": "صفحة حالة الخادم مكشوفة",
+    "dsstore": "ملف .DS_Store مكشوف",
+}
+
+
 def format_full_report(req, result) -> str:
     base = result.get("base_domain", req["ip"])
     score = result.get("score") or {}
@@ -856,6 +870,26 @@ def format_full_report(req, result) -> str:
         if cloud.get("private_existing"):
             lines.append(f"  (وُجدت {cloud['private_existing']} مخازن "
                          "موجودة لكنها خاصة — ليست ثغرة، معلومة فقط)")
+    vc = result.get("version_cves") or {}
+    if vc.get("status") == "ready" and vc.get("checked"):
+        lines.append("\n🧬 مطابقة الإصدارات مع CVE (قاعدة NVD):")
+        for prod in vc.get("products") or []:
+            top = (prod.get("top") or [{}])[0]
+            lines.append(f"  ▸ {prod.get('product')} {prod.get('version')} "
+                         f"({prod.get('source')}): {prod.get('total')} "
+                         f"ثغرة مؤكدة التطابق — أخطرها {top.get('id')} "
+                         f"(CVSS {top.get('cvss')})")
+            for v in (prod.get("top") or [])[1:3]:
+                lines.append(f"    • {v.get('id')} (CVSS {v.get('cvss')})")
+        if vc.get("clean"):
+            lines.append("  إصدارات فُحصت ولا ثغرات منطبقة عليها: " +
+                         "، ".join(vc["clean"]))
+        if vc.get("unmatched"):
+            lines.append("  تعذّرت مطابقة: " + "، ".join(vc["unmatched"]) +
+                         " (لم تُحتسب لها أي نتيجة)")
+        lines.append("  تنبيه: المطابقة على رقم الإصدار المعلن — توزيعات "
+                     "لينكس قد ترقّع ثغرة دون تغيير الرقم (backport)، "
+                     "فتحقّق من سجلّ التوزيعة قبل الجزم النهائي.")
     hosts = result.get("hosts") or []
     if hosts:
         lines.append("\n🖥️ المضيفون المقيّمون:")
@@ -922,6 +956,12 @@ def format_full_report(req, result) -> str:
                 lines.append(f"    نقاط API مستخرجة: "
                              f"{len(js['api_endpoints'])} "
                              f"(مثال: {js['api_endpoints'][0]})")
+        hidden = h.get("hidden") or {}
+        if hidden.get("status") == "ready" and hidden.get("findings"):
+            lines.append("  🗂️ محتوى حسّاس مكشوف (مُتحقق من توقيع محتواه):")
+            for f in hidden["findings"][:6]:
+                lines.append(f"    🔴 {f.get('path')} — "
+                             f"{HIDDEN_KIND_AR.get(f.get('kind'), 'ملف حسّاس مكشوف')}")
     ports_by_ip = result.get("ports_by_ip") or []
     if ports_by_ip:
         lines.append("\n🔌 المنافذ (أشهر 100 لكل خادم):")
