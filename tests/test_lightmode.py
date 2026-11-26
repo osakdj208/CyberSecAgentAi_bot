@@ -177,6 +177,15 @@ class BotLightLineTests(unittest.TestCase):
         text = bot.format_full_report(req, legacy)
         self.assertNotIn("وضع التشغيل: خفيف", text)
 
+    def test_footer_bounds_follow_profile(self):
+        req = {"ip": "example.com", "auth_ref": "ref-123"}
+        light = bot.format_full_report(req, dict(CANNED))
+        self.assertIn("حتى 6 مضيفين", light)
+        full = dict(CANNED)
+        full["scan_profile"] = "full"
+        self.assertIn("حتى 10 مضيفين",
+                      bot.format_full_report(req, full))
+
 
 if __name__ == "__main__":
     unittest.main()
