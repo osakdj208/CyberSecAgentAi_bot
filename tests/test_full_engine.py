@@ -246,6 +246,10 @@ class FullScanOrchestrationTests(unittest.TestCase):
                                              "exposed": [],
                                              "private_existing": 0,
                                              "candidates_checked": 12}), \
+             mock.patch.object(main, "hidden_content_check",
+                               return_value={"status": "ready",
+                                             "findings": [],
+                                             "catch_all": False}), \
              mock.patch.object(main, "dns_records",
                                return_value={"status": "ready", "records": {}}):
             out = main.full_scan(req, authorization="Bearer test-engine-token",
