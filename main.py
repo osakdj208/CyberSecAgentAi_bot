@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Cyber Security AI Agent Engine", version="0.12.0")
+app = FastAPI(title="Cyber Security AI Agent Engine", version="0.13.0")
 NMAP_PATH = shutil.which("nmap")
 TOKEN = os.environ.get("ENGINE_API_TOKEN", "")
 PERMIT_SECRET = os.environ.get("SCAN_APPROVAL_SECRET", "")
@@ -113,7 +113,7 @@ def health(authorization: Optional[str] = Header(default=None)):
 @app.get("/tools")
 def tools(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"},{"name":"API surface & GraphQL introspection check","state":"ready"},{"name":"JavaScript mining (exposed secrets, API endpoints, internal addresses)","state":"ready"},{"name":"Cloud storage exposure check (S3 / Azure Blob / GCS)","state":"ready"},{"name":"Dependency vulnerability analysis (SCA via OSV.dev)","state":"ready"}]}
+    return {"available":[{"name":"Nmap TCP/service discovery","state":"ready" if NMAP_PATH else "unavailable","profile":"top 100 ports, conservative timing, no exploit scripts"},{"name":"RDAP allocation lookup","state":"ready"},{"name":"RIPEstat ASN/routing lookup","state":"ready"},{"name":"Reverse DNS","state":"ready"},{"name":"IP geolocation","state":"ready"},{"name":"AbuseIPDB reputation","state":"ready" if ABUSEIPDB_KEY else "optional_api_key_required"},{"name":"Nuclei vulnerability detection (curated, no intrusive tags)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"TLS deep probe (certificate, protocols, legacy)","state":"ready"},{"name":"HTTP security headers & cookies analysis","state":"ready"},{"name":"DNS records inventory","state":"ready" if dns else "unavailable"},{"name":"Katana deep crawl (deep mode)","state":"ready" if KATANA_PATH else "unavailable"},{"name":"Nuclei CVE tree, per-year batches (deep mode)","state":"ready" if NUCLEI_PATH else "unavailable"},{"name":"Origin discovery behind CDNs (deep mode)","state":"ready"},{"name":"Origin-direct web assessment","state":"ready"},{"name":"Owner-agreed CDN pass fingerprint","state":"ready"},{"name":"Full attack-surface assessment (subdomains, per-host web, ports, score)","state":"ready"},{"name":"Email security audit (SPF / DMARC / DKIM selectors)","state":"ready" if dns else "unavailable"},{"name":"Android APK static analysis (manifest, permissions, components, embedded secrets, signer)","state":"ready" if _AndroAPK else "unavailable"},{"name":"Subdomain takeover detection (dangling CNAME fingerprints)","state":"ready" if dns else "unavailable"},{"name":"Deep DNS audit (AXFR attempt, DNSSEC, CAA)","state":"ready" if dns else "unavailable"},{"name":"API surface & GraphQL introspection check","state":"ready"},{"name":"JavaScript mining (exposed secrets, API endpoints, internal addresses)","state":"ready"},{"name":"Cloud storage exposure check (S3 / Azure Blob / GCS)","state":"ready"},{"name":"Dependency vulnerability analysis (SCA via OSV.dev)","state":"ready"},{"name":"Version-to-CVE matching (NVD, strict applicability filter)","state":"ready"},{"name":"Sensitive content exposure (signature-verified paths)","state":"ready"},{"name":"Expanded passive subdomain sources (crt.sh, HackerTarget, urlscan, Wayback)","state":"ready"}]}
 
 @app.post("/scans/intel")
 def intel_scan(request: ScanRequest, authorization: Optional[str] = Header(default=None), x_scan_approval: Optional[str] = Header(default=None)):
@@ -837,11 +837,59 @@ def _resolve_quiet(host):
             continue
     return out
 
+def _hackertarget_subdomains(base):
+    text = _fetch_text(
+        f"https://api.hackertarget.com/hostsearch/?q={base}",
+        timeout=10, cap=262144)
+    names = set()
+    for line in (text or "").splitlines():
+        host = line.split(",")[0].strip().lower()
+        if host.endswith(base) and "@" not in host:
+            names.add(host)
+    return sorted(names)[:60]
+
+def _urlscan_subdomains(base):
+    try:
+        data = fetch_json(
+            f"https://urlscan.io/api/v1/search/?q=domain%3A{base}&size=100",
+            timeout=12)
+    except Exception:
+        return []
+    names = set()
+    if isinstance(data, dict):
+        for row in data.get("results") or []:
+            domain = ((row.get("page") or {}).get("domain") or "").lower()
+            if domain.endswith(base):
+                names.add(domain)
+    return sorted(names)[:60]
+
+def _wayback_subdomains(base):
+    try:
+        data = fetch_json(
+            f"https://web.archive.org/cdx/search/cdx?url=*.{base}"
+            "&output=json&fl=original&collapse=urlkey&limit=500",
+            timeout=15)
+    except Exception:
+        return []
+    names = set()
+    if isinstance(data, list):
+        for row in data[1:]:
+            if row:
+                host = (urllib.parse.urlparse(row[0]).hostname
+                        or "").lower()
+                if host.endswith(base):
+                    names.add(host)
+    return sorted(names)[:60]
+
 def discover_subdomains(base: str):
-    """Passive subdomain discovery: certificate-transparency names plus
+    """Passive subdomain discovery: certificate-transparency names,
+    public scan/archive indexes (HackerTarget, urlscan, Wayback), plus
     a bounded wordlist of names that actually resolve. Returns the
     sorted candidate hostnames (base itself excluded)."""
     names = set(_crtsh_subdomains(base))
+    for source in (_hackertarget_subdomains, _urlscan_subdomains,
+                   _wayback_subdomains):
+        names.update(source(base))
     for word in DISCOVERY_WORDS:
         candidate = f"{word}.{base}"
         if candidate not in names and _resolve_quiet(candidate):
@@ -1579,6 +1627,312 @@ async def sca_scan(request: Request, authorization: Optional[str] = Header(defau
         raise HTTPException(status_code=400, detail=f"Unsupported dependency file. Supported: {SCA_SUPPORTED}.")
     return {"status": "completed", "profile": "sca-osv-v1", **result}
 
+# ------------- Phase C4: version-to-CVE matching + sensitive content
+def _version_key(v):
+    m = re.match(r"(\d+(?:\.\d+)*)(.*)", str(v).strip())
+    if not m:
+        return ((), str(v))
+    return (tuple(int(x) for x in m.group(1).split(".")),
+            m.group(2).strip())
+
+def _version_cmp(a, b):
+    ka, kb = _version_key(a), _version_key(b)
+    n = max(len(ka[0]), len(kb[0]))
+    ta = ka[0] + (0,) * (n - len(ka[0]))
+    tb = kb[0] + (0,) * (n - len(kb[0]))
+    if ta != tb:
+        return -1 if ta < tb else 1
+    if ka[1] == kb[1]:
+        return 0
+    return -1 if ka[1] < kb[1] else 1
+
+def _cve_applies(cve, vendor, product, version):
+    """Strict applicability: some cpeMatch in the CVE's configuration
+    tree must be marked vulnerable, name our exact product, and either
+    pin our exact version or carry a version range covering it. NVD's
+    raw cpeName candidates include 'running on' noise — this filter is
+    what makes the match a finding instead of a guess."""
+    def walk(nodes):
+        for node in nodes or []:
+            for match in node.get("cpeMatch") or []:
+                if not match.get("vulnerable"):
+                    continue
+                parts = str(match.get("criteria", "")).split(":")
+                if len(parts) < 7:
+                    continue
+                if parts[3] != vendor or parts[4] != product:
+                    continue
+                crit_v, crit_u = parts[5], parts[6]
+                if crit_v not in ("*", "-"):
+                    kc, kv = _version_key(crit_v), _version_key(version)
+                    n = max(len(kc[0]), len(kv[0]))
+                    numeric_equal = (
+                        kc[0] + (0,) * (n - len(kc[0]))
+                        == kv[0] + (0,) * (n - len(kv[0])))
+                    if crit_u in ("*", "-", ""):
+                        suffix_ok = kc[1] == kv[1]
+                    else:
+                        # e.g. OpenSSH: criteria version 9.6 + update
+                        # p1 must equal a detected "9.6p1".
+                        suffix_ok = kv[1] == crit_u
+                    if numeric_equal and suffix_ok:
+                        return True
+                    continue
+                ok = True
+                if "versionStartIncluding" in match:
+                    ok &= _version_cmp(
+                        version, match["versionStartIncluding"]) >= 0
+                if "versionStartExcluding" in match:
+                    ok &= _version_cmp(
+                        version, match["versionStartExcluding"]) > 0
+                if "versionEndIncluding" in match:
+                    ok &= _version_cmp(
+                        version, match["versionEndIncluding"]) <= 0
+                if "versionEndExcluding" in match:
+                    ok &= _version_cmp(
+                        version, match["versionEndExcluding"]) < 0
+                if ok:
+                    return True
+            if walk(node.get("children")):
+                return True
+        return False
+
+    for config in cve.get("configurations") or []:
+        if walk(config.get("nodes")):
+            return True
+    return False
+
+def _cpe_version(product, version):
+    v = str(version).strip().split("-")[0].split("_")[0]
+    if product == "openssh":
+        v = re.sub(r"p\d+$", "", v)
+    return v
+
+def _nvd_pause():
+    time.sleep(6)
+
+def _nvd_cves_for_cpe(cpe):
+    url = ("https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName="
+           + urllib.parse.quote(cpe) + "&resultsPerPage=2000")
+    status, text = _http_get(url, timeout=25, cap=16777216)
+    if status != 200 or not text:
+        return None
+    try:
+        doc = json.loads(text)
+    except Exception:
+        return None
+    return [v.get("cve") or {} for v in doc.get("vulnerabilities") or []]
+
+def _cve_score(cve):
+    metrics = cve.get("metrics") or {}
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        for entry in metrics.get(key) or []:
+            data = entry.get("cvssData") or {}
+            if isinstance(data.get("baseScore"), (int, float)):
+                return float(data["baseScore"]), \
+                    data.get("baseSeverity") or entry.get("baseSeverity")
+    return None, None
+
+_BANNER_PATTERNS = [
+    (re.compile(r"Apache/(\d[\w.\-]*)"), "apache", "http_server",
+     "Apache httpd"),
+    (re.compile(r"nginx/(\d[\w.\-]*)"), "nginx", "nginx", "nginx"),
+    (re.compile(r"OpenSSL/(\d[\w.\-]*)"), "openssl", "openssl", "OpenSSL"),
+    (re.compile(r"PHP/(\d[\w.\-]*)"), "php", "php", "PHP"),
+    (re.compile(r"Microsoft-IIS/(\d[\w.\-]*)"), "microsoft",
+     "internet_information_services", "Microsoft IIS"),
+]
+_NMAP_PRODUCT_MAP = [
+    ("apache httpd", "apache", "http_server", "Apache httpd"),
+    ("openssh", "openbsd", "openssh", "OpenSSH"),
+    ("nginx", "nginx", "nginx", "nginx"),
+    ("openssl", "openssl", "openssl", "OpenSSL"),
+    ("microsoft iis", "microsoft", "internet_information_services",
+     "Microsoft IIS"),
+    ("mariadb", "mariadb", "mariadb", "MariaDB"),
+    ("mysql", "oracle", "mysql", "MySQL"),
+    ("postgresql", "postgresql", "postgresql", "PostgreSQL"),
+    ("vsftpd", "vsftpd", "vsftpd", "vsftpd"),
+    ("proftpd", "proftpd", "proftpd", "ProFTPD"),
+    ("exim", "exim", "exim", "Exim"),
+    ("dovecot", "dovecot", "dovecot", "Dovecot"),
+    ("isc bind", "isc", "bind", "ISC BIND"),
+    ("postfix", "postfix", "postfix", "Postfix"),
+    ("redis", "redis", "redis", "Redis"),
+    ("mongodb", "mongodb", "mongodb", "MongoDB"),
+    ("elasticsearch", "elastic", "elasticsearch", "Elasticsearch"),
+    ("php", "php", "php", "PHP"),
+]
+
+def collect_version_pairs(assessed, ports_by_ip):
+    pairs, seen = [], set()
+
+    def add(vendor, product, display, version, source):
+        version = str(version or "").strip()
+        if not version:
+            return
+        key = (vendor, product, version)
+        if key in seen:
+            return
+        seen.add(key)
+        pairs.append({"vendor": vendor, "product": product,
+                      "display": display, "version": version,
+                      "source": source})
+
+    for entry in ports_by_ip:
+        for port in entry.get("ports") or []:
+            if port.get("state") != "open":
+                continue
+            product_name = (port.get("product") or "").lower()
+            for marker, vendor, product, display in _NMAP_PRODUCT_MAP:
+                if marker in product_name:
+                    add(vendor, product, display, port.get("version"),
+                        f"منفذ {entry.get('ip')}:{port.get('port')}")
+                    break
+    for host in assessed:
+        http = host.get("http") or {}
+        for text in (http.get("server"), http.get("powered_by")):
+            if not text:
+                continue
+            for pattern, vendor, product, display in _BANNER_PATTERNS:
+                m = pattern.search(text)
+                if m:
+                    add(vendor, product, display, m.group(1),
+                        f"ترويسة {host.get('host')}")
+    return pairs
+
+def version_cve_check(pairs):
+    """Match detected product versions against NVD. Anonymous NVD
+    access allows ~5 requests per 30s, so calls are paced and the
+    product list is capped; every kept CVE passed the strict
+    applicability filter above."""
+    out = {"status": "ready", "checked": len(pairs), "products": [],
+           "clean": [], "unmatched": []}
+    first = True
+    for pair in pairs[:5]:
+        vendors = [(pair["vendor"], pair["product"])]
+        if (pair["vendor"], pair["product"]) == ("nginx", "nginx"):
+            vendors.append(("f5", "nginx"))
+        found, seen_ids, queried = [], set(), False
+        for vendor, product in vendors:
+            cpe = (f"cpe:2.3:a:{vendor}:{product}:"
+                   f"{_cpe_version(product, pair['version'])}")
+            if not first:
+                _nvd_pause()
+            first = False
+            cves = _nvd_cves_for_cpe(cpe)
+            if cves is None:
+                continue
+            queried = True
+            for cve in cves:
+                cid = cve.get("id")
+                if not cid or cid in seen_ids:
+                    continue
+                if _cve_applies(cve, vendor, product, pair["version"]):
+                    seen_ids.add(cid)
+                    score, sev = _cve_score(cve)
+                    desc = ""
+                    for d in cve.get("descriptions") or []:
+                        if d.get("lang") == "en":
+                            desc = str(d.get("value", ""))[:220]
+                            break
+                    found.append({"id": cid, "cvss": score,
+                                  "severity": sev, "summary": desc})
+        if not queried:
+            out["unmatched"].append(pair["display"])
+        elif found:
+            found.sort(key=lambda v: -(v["cvss"] or 0))
+            out["products"].append({
+                "product": pair["display"], "version": pair["version"],
+                "source": pair["source"], "total": len(found),
+                "top": found[:5]})
+        else:
+            out["clean"].append(
+                f"{pair['display']} {pair['version']}")
+    return out
+
+def _http_get_bytes(url, timeout=5, cap=262144):
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "CyberSecurityAI-Agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(cap)
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read(cap)
+        except Exception:
+            return exc.code, b""
+    except Exception:
+        return None, b""
+
+def _sensitive_signature(kind, body):
+    head = body[:300].lower()
+    if b"<html" in head or b"<!doctype" in head:
+        return False
+    if kind == "git_head":
+        return body.startswith(b"ref: refs/") or bool(
+            re.fullmatch(rb"[0-9a-f]{40}\s*", body[:64].strip()))
+    if kind == "git_config":
+        return b"[core]" in body
+    if kind == "env":
+        lines = body.decode("utf-8", "ignore").splitlines()
+        hits = sum(1 for ln in lines
+                   if re.match(r"^[A-Z][A-Z0-9_]{2,}=", ln.strip()))
+        return hits >= 2
+    if kind == "archive":
+        return body[:4] == b"PK\x03\x04" or body[:2] == b"\x1f\x8b"
+    if kind == "sql":
+        upper = body[:65536].upper()
+        return b"CREATE TABLE" in upper or b"INSERT INTO" in upper
+    if kind == "dsstore":
+        return body[4:8] == b"Bud1"
+    if kind == "config":
+        return b"DB_PASSWORD" in body or (b"define" in body
+                                          and b"DB_" in body)
+    if kind == "svn":
+        return b"wc-entries" in body[:512]
+    if kind == "hg":
+        return b"[paths]" in body
+    if kind == "status":
+        return b"Apache Server Status" in body
+    return False
+
+SENSITIVE_PATHS = [
+    ("/.git/HEAD", "git_head"), ("/.git/config", "git_config"),
+    ("/.env", "env"), ("/.env.local", "env"),
+    ("/.env.production", "env"),
+    ("/backup.zip", "archive"), ("/backup.tar.gz", "archive"),
+    ("/www.zip", "archive"),
+    ("/db.sql", "sql"), ("/dump.sql", "sql"),
+    ("/database.sql", "sql"),
+    ("/.DS_Store", "dsstore"),
+    ("/wp-config.php.bak", "config"), ("/config.php.bak", "config"),
+    ("/.svn/entries", "svn"), ("/.hg/hgrc", "hg"),
+    ("/server-status", "status"),
+]
+
+def hidden_content_check(host, scheme):
+    """Sensitive-path exposure, proven by content signature. A random
+    nonexistent path is fetched first: a candidate whose body equals
+    the baseline (catch-all sites) is never reported."""
+    base = f"{scheme}://{host}"
+    token = secrets.token_hex(4)
+    bstatus, bbody = _http_get_bytes(
+        base + f"/probe-{token}-nonexistent", timeout=5, cap=65536)
+    baseline = hashlib.sha256(bbody).hexdigest() if bbody else None
+    findings = []
+    for path, kind in SENSITIVE_PATHS:
+        status, body = _http_get_bytes(base + path, timeout=5,
+                                       cap=262144)
+        if status != 200 or not body:
+            continue
+        if baseline and hashlib.sha256(body).hexdigest() == baseline:
+            continue
+        if _sensitive_signature(kind, body):
+            findings.append({"path": path, "kind": kind})
+    return {"status": "ready", "findings": findings,
+            "catch_all": bstatus == 200}
+
 COOKIE_FRAMEWORK_HINTS = (
     ("phpsessid", "PHP"), ("jsessionid", "Java"),
     ("asp.net_sessionid", "ASP.NET"), ("aspsessionid", "ASP.NET"),
@@ -1611,7 +1965,7 @@ DB_PORTS = {3306: "MySQL", 5432: "PostgreSQL", 1433: "MSSQL",
             9200: "Elasticsearch", 11211: "Memcached", 5984: "CouchDB"}
 
 def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None,
-               cloud=None):
+               cloud=None, version_cves=None):
     """Transparent 0-100 posture score: every deduction is listed so
     the report can show exactly why the score is what it is."""
     score = 100
@@ -1629,7 +1983,7 @@ def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None,
 
     caps = {"_caps": {"nuclei": 40, "tls": 16, "headers": 12,
                       "ports": 24, "email": 22, "takeover": 20, "dns": 12,
-                      "surface": 16, "cloud": 14}}
+                      "surface": 16, "cloud": 14, "versions": 18}}
     nonlocal_score = [score]
     sev_points = {"critical": (15, "نتيجة Nuclei حرجة"), "high": (8, "نتيجة Nuclei عالية"),
                   "medium": (3, "نتيجة Nuclei متوسطة"), "low": (1, "نتيجة Nuclei منخفضة")}
@@ -1728,6 +2082,25 @@ def full_score(hosts, ports_by_ip, email, dns_audit=None, takeover=None,
                           f"{host['host']}: "
                           f"{', '.join(js['internal_addresses'][:3])}",
                        "surface", caps)
+        hidden = host.get("hidden") or {}
+        if hidden.get("status") == "ready":
+            kind_points = {"git_head": 8, "git_config": 8, "env": 8,
+                           "archive": 5, "sql": 5, "config": 5,
+                           "svn": 4, "hg": 4, "status": 3, "dsstore": 2}
+            for f in hidden.get("findings") or []:
+                deduct(kind_points.get(f.get("kind"), 3),
+                       f"محتوى حسّاس مكشوف على {host['host']}: "
+                       f"{f.get('path')}", "surface", caps)
+    if version_cves and version_cves.get("status") == "ready":
+        sev_points_v = {"CRITICAL": 8, "HIGH": 5, "MEDIUM": 2}
+        for prod in version_cves.get("products") or []:
+            top = (prod.get("top") or [{}])[0]
+            pts = sev_points_v.get((top.get("severity") or "").upper())
+            if pts:
+                deduct(pts, f"ثغرات معروفة منطبقة على "
+                            f"{prod.get('product')} {prod.get('version')} "
+                            f"(أخطرها {top.get('id')} — CVSS "
+                            f"{top.get('cvss')})", "versions", caps)
     if cloud and cloud.get("status") == "ready":
         for b in cloud.get("exposed") or []:
             deduct(10, f"مخزن سحابي مفتوح للعامة: {b.get('name')} "
@@ -1766,7 +2139,8 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
                          "tls": tls, "tech": tech_fingerprint(http),
                          "nuclei": {"status": "skipped"},
                          "api": {"status": "skipped"},
-                         "js": {"status": "skipped"}})
+                         "js": {"status": "skipped"},
+                         "hidden": {"status": "skipped"}})
     live = [h for h in assessed if (h.get("http") or {}).get("status") == "ready"]
     nuclei_done = 0
     for entry in live:
@@ -1774,6 +2148,7 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             entry["nuclei"] = {"status": "skipped_budget"}
             entry["api"] = {"status": "skipped_budget"}
             entry["js"] = {"status": "skipped_budget"}
+            entry["hidden"] = {"status": "skipped_budget"}
             continue
         entry["nuclei"] = nuclei_scan(entry["host"], deep=False)
         nuclei_done += 1
@@ -1781,9 +2156,11 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             scheme = (entry.get("http") or {}).get("scheme") or "https"
             entry["api"] = api_surface_check(entry["host"], scheme)
             entry["js"] = js_mining(entry["host"], scheme)
+            entry["hidden"] = hidden_content_check(entry["host"], scheme)
         else:
             entry["api"] = {"status": "skipped_budget"}
             entry["js"] = {"status": "skipped_budget"}
+            entry["hidden"] = {"status": "skipped_budget"}
     ports_by_ip = []
     for ip in all_ips[:4]:
         if time.time() - started > 1250:
@@ -1800,8 +2177,16 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
     takeover = subdomain_takeover_check(candidates)
     cloud = cloud_storage_check(base) if time.time() - started <= 1250 \
         else {"status": "skipped_budget"}
+    pairs = collect_version_pairs(assessed, ports_by_ip)
+    if pairs and time.time() - started <= 1300:
+        version_cves = version_cve_check(pairs)
+    elif pairs:
+        version_cves = {"status": "skipped_budget"}
+    else:
+        version_cves = {"status": "ready", "checked": 0, "products": [],
+                        "clean": [], "unmatched": []}
     score = full_score(assessed, ports_by_ip, email, dns_audit, takeover,
-                       cloud)
+                       cloud, version_cves)
     priorities = [d["label"] for d in score["deductions"][:8]]
     return {"status": "completed", "target": host, "base_domain": base,
             "resolved_ips": ips,
@@ -1813,15 +2198,17 @@ def full_scan(request: FullScanRequest, authorization: Optional[str] = Header(de
             "dns": dns_records(host),
             "hosts": assessed, "ports_by_ip": ports_by_ip,
             "email": email, "dns_audit": dns_audit, "takeover": takeover,
-            "cloud": cloud,
+            "cloud": cloud, "version_cves": version_cves,
             "score": score, "priorities": priorities,
             "limitations": ["Detection only: identical guardrails to the web assessment (curated Nuclei templates, no intrusive tags, no exploitation).",
-                            "Discovery is passive (certificate transparency + resolving wordlist); subdomains that exist but are neither in CT logs nor in the wordlist will not appear.",
+                            "Discovery is passive (certificate transparency, public scan/archive indexes, resolving wordlist); subdomains that exist but are in none of those sources will not appear.",
                             "Bounds: at most 10 hosts probed, 3 hosts get a full Nuclei run, 4 IPs get a top-100 port scan, within one time budget; anything beyond is reported as skipped, never silently dropped.",
                             "The score is a transparent heuristic: every deduction is listed with its reason; it prioritizes fixes, it is not a certification.",
                             "Deep DNS audit attempts a zone transfer only against the domain's own nameservers; takeover verdicts are labelled confirmed (the service's unclaimed page answered) or likely (the alias target no longer resolves).",
                             "API/GraphQL checks read public schema documents and ask a GraphQL endpoint only its minimal schema question; JavaScript mining covers same-host scripts only (up to 8 files per host), and secrets are shown by short prefix only.",
-                            "Cloud storage checks probe bucket names derived from the domain on S3, GCS and Azure Blob; a bucket counts as exposed only when an anonymous listing actually succeeds."]}
+                            "Cloud storage checks probe bucket names derived from the domain on S3, GCS and Azure Blob; a bucket counts as exposed only when an anonymous listing actually succeeds.",
+                            "Version-to-CVE matching uses NVD with a strict applicability filter (vulnerable flag + exact product + exact version or covering range). It matches the ADVERTISED version: Linux distributions may backport a fix without changing the version string, so confirm against the distribution's changelog before treating a match as final.",
+                            "Sensitive-content findings are proven by content signature and cross-checked against a random-path baseline, so catch-all sites do not produce them."]}
 
 # ------------------------------------------------- Android APK static analysis
 import io, zipfile
