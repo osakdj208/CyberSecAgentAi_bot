@@ -92,6 +92,8 @@ class FullFlowTests(unittest.TestCase):
         bot.handle_message(self.msg("domain-verification-42"))
         self.assertEqual(bot.STATE[7]["step"], "f_await_proof")
         bot.handle_message(self.msg("تخطي"))
+        self.assertEqual(bot.STATE[7]["step"], "f_await_pass")
+        bot.handle_message(self.msg("تخطي"))
         rows = bot.list_requests(42)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "full")
